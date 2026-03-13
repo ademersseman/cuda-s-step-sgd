@@ -53,7 +53,8 @@ void train(
     float lr,
     const std::vector<float>& hA,
     const std::vector<float>& hy,
-    int print_interval)
+    int print_interval,
+    ProfileStats* stats)
 {
     // gradient buffer
     float* d_grad;
@@ -105,12 +106,11 @@ void train(
 
         int b = iter % num_batches;
 
-        float* batch_X = d_A + b * samples_per_step * n_features;
+        float* batch_A = d_A + b * samples_per_step * n_features;
         float* batch_y = d_y + b * samples_per_step;
 
         cudaMemset(d_grad, 0, n_features*sizeof(float));
-
-        compute_sstep_gradient(batch_X, batch_y, d_x, d_grad, batch_size, s, lr, n_features);
+        compute_sstep_gradient(batch_A, batch_y, d_x, d_grad, batch_size, s, lr, n_features, iter, stats);
         update_weights(d_x, d_grad, lr, n_features, samples_per_step);
 
         iters += s;
@@ -170,25 +170,40 @@ int main() {
     cudaMalloc(&dA, total_samples * n_features * sizeof(float));
     cudaMalloc(&dy, total_samples * sizeof(float));
     cudaMalloc(&dx, n_features * sizeof(float));
-
+    // copy data to GPU
     cudaMemcpy(dA, hA.data(), total_samples * n_features * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(dy, hy.data(), total_samples * sizeof(float), cudaMemcpyHostToDevice);
     // set initial weights to zero
     cudaMemset(dx, 0, n_features * sizeof(float));
 
-    train(dA, dy, dx, total_samples, n_features, batch_size, s, maxiters, lr, hA, hy, print_interval);
-
+    ProfileStats hstats;
+    hstats.gram_time = 0.0f;
+    hstats.init_corr_time = 0.0f;
+    hstats.recurrence_time = new float[maxiters]();
+    
+    
+    train(dA, dy, dx, total_samples, n_features, batch_size, s, maxiters, lr, hA, hy, print_interval, &hstats);
+    
     // Copy back weights into hW for printing
     std::vector<float> hW(n_features);
     cudaMemcpy(hW.data(), dx, n_features * sizeof(float), cudaMemcpyDeviceToHost);
-
+    
     // Add this to print weights
     std::cout << "Final weights:" << std::endl;
     for (int i = 0; i < n_features; ++i) {
         std::cout << hW[i] << "\n";
     }
-    std::cout << n_features;
-    std::cout << std::endl;
+    std::cout << n_features << std::endl;
+    
+    for (size_t i = 0; i < maxiters; i++) {
+        std::cout << "Recurrence time for block " << (i + 1) << ": " << hstats.recurrence_time[i] << " ms" << std::endl;
+    }
+    
+        
+    std::cout << "Gram time: " << hstats.gram_time << " ms" << std::endl;
+
+    //cudaFree(dstats->recurrence_time);
+    //cudaFree(dstats);
 
     cudaFree(dA);
     cudaFree(dy);
