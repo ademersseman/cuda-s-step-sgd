@@ -67,9 +67,8 @@ __global__ void compute_Ax_kernel(float *A, float *x, float *correction, int tot
 // Kernel to compute block Gram matrix G = A*A'
 __global__ void compute_Gram_kernel(float *A, float *G, int total_samples, int n_features, int batch_size)
 {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int i = tid / total_samples;
-    int j = tid % total_samples;
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
 
     if (i < total_samples && j < total_samples)
     {
@@ -173,8 +172,9 @@ void compute_sstep_gradient(float *A, float *y, float *x, float *grad, int batch
 
     auto t1 = std::chrono::high_resolution_clock::now();
     // Compute Gram matrix G = A_scaled*A_scaled'
-    int threads_per_dim_G = (total_samples + num_blocks - 1) / num_blocks; 
-    compute_Gram_kernel<<<num_blocks, threads_per_dim_G>>>(d_A_scaled, d_G, total_samples, n_features, batch_size);
+    dim3 blocks_G(num_blocks, num_blocks);
+    dim3 threads_G((total_samples + num_blocks - 1) / num_blocks, (total_samples + num_blocks - 1) / num_blocks);
+    compute_Gram_kernel<<<blocks_G, threads_G>>>(d_A_scaled, d_G, total_samples, n_features, batch_size);
     cudaDeviceSynchronize();
     
     auto t2 = std::chrono::high_resolution_clock::now();
