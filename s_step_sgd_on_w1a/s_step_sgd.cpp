@@ -142,9 +142,9 @@ int main(int argc, char** argv) {
     // Command-line arguments:
     //   [batch_size] [s] [num_blocks]
     // If any argument is omitted, the default value is used.
-    int batch_size = 256;
+    int batch_size = 16;
     int s = 16;
-    int num_blocks = 1;
+    int num_blocks = 256;
 
     if (argc > 1) {
         if (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
@@ -188,7 +188,6 @@ int main(int argc, char** argv) {
     int printerval = 512;
 
     // how many used in the compute gram matrix kernel
-    // int num_blocks = 1;
     
     // Pad data to be multiple of s * batch_size
     // samples per iteration
