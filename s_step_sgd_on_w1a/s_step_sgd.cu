@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include "s_step_sgd.h"
 #include <stdio.h>
+#include <chrono>
 
 #define BLOCK_SIZE 256
 
@@ -66,8 +67,9 @@ __global__ void compute_Ax_kernel(float *A, float *x, float *correction, int tot
 // Kernel to compute block Gram matrix G = A*A'
 __global__ void compute_Gram_kernel(float *A, float *G, int total_samples, int n_features, int batch_size)
 {
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    int j = threadIdx.y + blockIdx.y * blockDim.y;
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int i = tid / total_samples;
+    int j = tid % total_samples;
 
     if (i < total_samples && j < total_samples)
     {
@@ -140,64 +142,50 @@ __global__ void update_weights_kernel(float *x, float *grad, float lr, int n_fea
 }
 
 // ---------------- Wrapper Functions ----------------
-extern "C" void compute_gradient(float *A, float *y, float *x, float *grad, int batch_size, int n_features)
+void compute_gradient(float *A, float *y, float *x, float *grad, int batch_size, int n_features)
 {
     int blocks_features = (n_features + BLOCK_SIZE - 1) / BLOCK_SIZE; // Fixed: use n_features for grid size
     compute_gradient_kernel<<<blocks_features, BLOCK_SIZE>>>(A, y, x, grad, batch_size, n_features);
     cudaDeviceSynchronize();
 }
 
-extern "C" void compute_sstep_gradient(float *A, float *y, float *x, float *grad, int batch_size, int s, float eta, int n_features, int iter, ProfileStats *stats)
+void compute_sstep_gradient(float *A, float *y, float *x, float *grad, int batch_size, int s, float eta, int n_features, int iter, ProfileStats *stats, int num_blocks)
 {
+    // # rows, 
     int total_samples = s * batch_size;
 
     // Allocate device memory for intermediate computations
-    float *d_X_scaled;
+    float *d_A_scaled;
     float *d_correction;
     float *d_G;
-    cudaMalloc(&d_X_scaled, total_samples * n_features * sizeof(float));
+    cudaMalloc(&d_A_scaled, total_samples * n_features * sizeof(float));
     cudaMalloc(&d_correction, total_samples * sizeof(float));
     cudaMalloc(&d_G, total_samples * total_samples * sizeof(float));
 
     // Scale A by y: X_scaled[i,j] = A[i,j] * y[i]
     int blocks_samples = (total_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    scale_A_by_y_kernel<<<blocks_samples, BLOCK_SIZE>>>(A, y, d_X_scaled, total_samples, n_features);
+    scale_A_by_y_kernel<<<blocks_samples, BLOCK_SIZE>>>(A, y, d_A_scaled, total_samples, n_features);
     cudaDeviceSynchronize();
 
     // Compute initial correction = A_scaled*x
-    compute_Ax_kernel<<<blocks_samples, BLOCK_SIZE>>>(d_X_scaled, x, d_correction, total_samples, n_features);
+    compute_Ax_kernel<<<blocks_samples, BLOCK_SIZE>>>(d_A_scaled, x, d_correction, total_samples, n_features);
     cudaDeviceSynchronize();
 
-    cudaEvent_t start_gram, stop_gram;
-    cudaEventCreate(&start_gram);
-    cudaEventCreate(&stop_gram);
-
-    cudaEventRecord(start_gram);
+    auto t1 = std::chrono::high_resolution_clock::now();
     // Compute Gram matrix G = A_scaled*A_scaled'
-    dim3 blocks_G((total_samples + 15) / 16, (total_samples + 15) / 16);
-    dim3 threads_G(16, 16);
-    compute_Gram_kernel<<<blocks_G, threads_G>>>(d_X_scaled, d_G, total_samples, n_features, batch_size);
+    int threads_per_dim_G = (total_samples + num_blocks - 1) / num_blocks; 
+    compute_Gram_kernel<<<num_blocks, threads_per_dim_G>>>(d_A_scaled, d_G, total_samples, n_features, batch_size);
     cudaDeviceSynchronize();
     
-    cudaEventRecord(stop_gram);
-    float elapsed_gram;
-    cudaEventElapsedTime(&elapsed_gram, start_gram, stop_gram);
-    stats->gram_time += elapsed_gram;
-    cudaEventDestroy(start_gram);
-    cudaEventDestroy(stop_gram);
+    auto t2 = std::chrono::high_resolution_clock::now();
+    stats->gram_time[iter] = std::chrono::duration<double>(t2 - t1).count() * 1000.0; // Convert to milliseconds
     
-    //printf("Recurrence computation time for block %d according to device: %f ms\n", iter, elapsed_gram);
     // Apply sigmoid to first block (i=0) BEFORE using it in corrections, we don't want to call apply_all_corrections_kernel with i=0
     int blocks_sigmoid = (batch_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     apply_sigmoid_kernel<<<blocks_sigmoid, BLOCK_SIZE>>>(d_correction, total_samples, batch_size, 0);
     
     cudaDeviceSynchronize();
-    
-    cudaEvent_t start_recurrence, stop_recurrence;
-    cudaEventCreate(&start_recurrence);
-    cudaEventCreate(&stop_recurrence);
-
-    cudaEventRecord(start_recurrence);
+    t1 = std::chrono::high_resolution_clock::now();
     // Apply corrections for each block i from 1 to s-1
     for (int i = 1; i < s; i++)
     {
@@ -211,28 +199,22 @@ extern "C" void compute_sstep_gradient(float *A, float *y, float *x, float *grad
         
         cudaDeviceSynchronize();
     }
-    cudaEventRecord(stop_recurrence);
+    t2 = std::chrono::high_resolution_clock::now();
     
-    
-    float elapsed_recurrence;
-    cudaEventElapsedTime(&elapsed_recurrence, start_recurrence, stop_recurrence);
-    stats->recurrence_time[iter] = elapsed_recurrence;   
-  
-    cudaEventDestroy(start_recurrence);
-    cudaEventDestroy(stop_recurrence);
-    
+    stats->recurrence_time[iter] = std::chrono::duration<double>(t2 - t1).count() * 1000.0; // Convert to milliseconds
+
     // Compute final gradient = -A_scaled' * correction
     int blocks_grad = (n_features + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    compute_final_gradient_kernel<<<blocks_grad, BLOCK_SIZE>>>(d_X_scaled, d_correction, grad, total_samples, n_features);
+    compute_final_gradient_kernel<<<blocks_grad, BLOCK_SIZE>>>(d_A_scaled, d_correction, grad, total_samples, n_features);
     cudaDeviceSynchronize();
 
     // Free temporary memory
-    cudaFree(d_X_scaled);
+    cudaFree(d_A_scaled);
     cudaFree(d_correction);
     cudaFree(d_G);
 }
 
-extern "C" void update_weights(float *x, float *grad, float lr, int n_features, int batch_size)
+void update_weights(float *x, float *grad, float lr, int n_features, int batch_size)
 {
     int blocks_weights = (n_features + BLOCK_SIZE - 1) / BLOCK_SIZE;
     update_weights_kernel<<<blocks_weights, BLOCK_SIZE>>>(x, grad, lr, n_features, batch_size);
