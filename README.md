@@ -1,1 +1,1 @@
-nul && nvcc -o C:\CS5999\s_step_sgd_on_w1a\s_step_sgd.exe C:\CS5999\s_step_sgd_on_w1a\s_step_sgd.cpp C:\CS5999\s_step_sgd_on_w1a\s_step_sgd.cu
+nvcc -o s_step_sgd_on_w1a\s_step_sgd.exe s_step_sgd_on_w1a\s_step_sgd.cpp s_step_sgd_on_w1a\s_step_sgd.cu -lcublas
