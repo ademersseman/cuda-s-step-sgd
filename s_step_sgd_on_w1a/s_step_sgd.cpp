@@ -12,6 +12,8 @@
 #include <memory>
 #include <numeric>
 #include <chrono>
+#include <cstdlib>
+#include <ctime>
 
 #define BLOCK_SIZE 256
 
@@ -93,7 +95,6 @@ bool compare_with_matlab_weights(const std::vector<float>& weights, const std::s
         std::cerr << "Error: Cannot open matlab weights file '" << filename << "'\n";
         return false;
     }
-
     std::vector<float> matlab;
     float value;
     while (file >> value) {
@@ -145,7 +146,7 @@ bool compare_with_matlab_weights(const std::vector<float>& weights, const std::s
     return true;
 }
 
-void compute_sstep_gradient(float *A, float *y, float *x, float *grad, int batch_size, int s, float eta, int n_features, int iter, ProfileStats *stats, int num_blocks)
+void compute_sstep_gradient(float *A, float *y, float *x, float *grad, int batch_size, int s, float eta, int n_features, ProfileStats *stats)
 {
     int total_samples = s * batch_size;
 
@@ -160,16 +161,34 @@ void compute_sstep_gradient(float *A, float *y, float *x, float *grad, int batch
     cublasCreate(&handle);
     float alpha = 1;
     float beta = 0;
+    
+    double scaling_start = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
 
-    
     // Scale A by y
-    cublasSdgmm(handle, CUBLAS_SIDE_RIGHT, n_features, total_samples,
-    A, n_features, y, 1, d_A_scaled, n_features);
-    // Compute initial correction = A_scaled * x
-    cublasSgemv(handle, CUBLAS_OP_T, n_features, total_samples, 
-    &alpha, d_A_scaled, n_features, x, 1, &beta, d_correction, 1);
+    cublasSdgmm(handle, CUBLAS_SIDE_RIGHT, n_features, total_samples, A, n_features, y, 1, d_A_scaled, n_features);
+
+    double scaling_end = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
     
-    // Compute Gram matrix G = A_scaled * A_scaled'
+    stats->scaling_time += scaling_end - scaling_start;
+
+    double corr_start = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
+
+    // Compute initial correction = A_scaled * x
+    cublasSgemv(handle, CUBLAS_OP_T, n_features, total_samples, &alpha, d_A_scaled, n_features, x, 1, &beta, d_correction, 1);
+    
+    double corr_end = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
+
+    stats->init_corr_time += corr_end - corr_start;
+    
+    double gram_start = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
+    // Compute full Gram matrix G = A_scaled * A_scaled'
+    /*
+    */
     cublasSgemm(
         handle,
         CUBLAS_OP_T,             // op(A) = A^T in cuBLAS = your row-major A
@@ -182,52 +201,79 @@ void compute_sstep_gradient(float *A, float *y, float *x, float *grad, int batch
         d_A_scaled, n_features,           // ldb = n_features (same matrix)
         &beta,
         d_G, total_samples       // ldc = total_samples
-    );
+        );
+    /*
+    // Approximate Gram matrix using sampling (from Drineas et al. paper)
+    int l = 30; // number of sampled features
+    std::vector<int> selected_features(l);
+    for(int i = 0; i < l; i++) {
+        selected_features[i] = rand() % n_features;
+    }
     
-    // Apply sigmoid to first block
-    cuda_apply_sigmoid_block(d_correction, total_samples, batch_size, 0);
-
-    // Apply corrections for each block i from 1 to s-1
+    float *d_A_scaled_sub;
+    cudaMalloc(&d_A_scaled_sub, total_samples * l * sizeof(float));
+    
+    // Use cublasScopy to copy selected columns of d_A_scaled into d_A_scaled_sub
+    // d_A_scaled layout: (total_samples x n_features) row-major
+    // → column src_col starts at offset src_col, with stride n_features
+    // d_A_scaled_sub layout: (total_samples x l) row-major
+    // → column i starts at offset i, with stride l
+    for(int i = 0; i < l; i++) {
+        int src_col = selected_features[i];
+        cublasScopy(handle,
+        total_samples,
+        d_A_scaled + src_col, n_features,  // src: col src_col, stride = n_features
+        d_A_scaled_sub + i,   l);          // dst: col i,       stride = l
+    }
+    
+    // Compute approximate Gram matrix G_hat = (n_features / l) * A_sub * A_sub^T
+    // Both matrices are row-major (total_samples x l).
+    // cuBLAS is col-major, so we compute G = A_sub^T * A_sub in cuBLAS terms,
+    // which gives the col-major result equal to the row-major A_sub * A_sub^T.
+    float alpha_approx = n_features / (float)l;
+    cublasSgemm(
+        handle,
+        CUBLAS_OP_T,                    // op(A): transpose A_sub (col-major view)
+        CUBLAS_OP_N,                    // op(B): no-op on A_sub (col-major view)
+        total_samples,                  // m: rows of output
+        total_samples,                  // n: cols of output
+        l,                              // k: inner dimension
+        &alpha_approx,
+        d_A_scaled_sub, l,              // A: lda = l (col-major: l rows)
+        d_A_scaled_sub, l,              // B: ldb = l
+        &beta,
+        d_G, total_samples              // C: ldc = total_samples, row-major output
+    );
+    */
+    double gram_end = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
+        stats->gram_time += gram_end - gram_start;
+        
     double recurrence_start = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
-
-    for (int i = 1; i < s; i++)
-    {
-        float alpha = eta;
-        float beta  = 1.0f;  // because we want +=
-
-        int rows = i * batch_size;  // number of columns in row-major view
-        int cols = batch_size;            // number of rows in row-major view
+           
+        // Apply corrections for each block i from 1 to s-1
+    for (int i = 0; i < s; i++) {
         int i_start = i * batch_size;
-
-        float* G_block = d_G + i_start * total_samples;   // start of the row block
-        float* correction_prev = d_correction;           // first i_block*batch_size entries
-        float* correction_curr = d_correction + i_start; // current block
-
-        // GEMV call
-        cublasSgemv(
-            handle,
-            CUBLAS_OP_T,       // transpose to account for row-major layout
-            rows,              // number of rows in the transposed view = i_block * batch_size
-            cols,              // number of columns in the transposed view = batch_size
-            &alpha,
-            G_block,           // pointer to the block
-            total_samples,     // leading dimension = original row-major stride
-            correction_prev,   // input vector
-            1,                 // stride
-            &beta,
-            correction_curr,   // output vector
-            1
-        );
-        
-        //cuda_apply_all_corrections(d_G, d_correction, total_samples, batch_size, i, eta);
+        float beta = 1.0f;
+        for (int j = 0; j < i; j++)
+        {
+            int j_start = j * batch_size;
+            float* subG = d_G + i_start * total_samples + j_start;
+            float* corr_j = d_correction + j_start;
+            float* corr_curr = d_correction + i_start;
+            cublasSgemv(handle, CUBLAS_OP_T, batch_size, batch_size, &eta, subG, total_samples, corr_j, 1, &beta, corr_curr, 1);
+        }
         cuda_apply_sigmoid_block(d_correction, total_samples, batch_size, i);
     }
-
+  
     double recurrence_end = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
-    stats->recurrence_time[iter] = (float)(recurrence_end - recurrence_start);
+    stats->recurrence_time += recurrence_end - recurrence_start;
 
+    double grad_proj_start = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
+    
     float negalpha = -1.0f;
     
     // Compute final gradient = -A_scaled' * correction
@@ -246,11 +292,16 @@ void compute_sstep_gradient(float *A, float *y, float *x, float *grad, int batch
         1
     );
 
+    double grad_proj_end = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
+    stats->grad_proj_time += grad_proj_end - grad_proj_start;
+
     // Cleanup
     cublasDestroy(handle);
     cudaFree(d_A_scaled);
     cudaFree(d_correction);
     cudaFree(d_G);
+    //cudaFree(d_A_scaled_sub);
 }
 
 // ---------------- Train Function ----------------
@@ -267,47 +318,46 @@ void train(
     const std::vector<float>& h_A,
     const std::vector<float>& h_y,
     int printerval,
-    ProfileStats* stats,
-    int num_blocks)
+    ProfileStats* stats)
 {
     // gradient buffer
     float* d_grad;
     cudaMalloc(&d_grad, n_features * sizeof(float));
 
-    int samples_per_step = s * batch_size;
-    int num_batches = total_samples / samples_per_step;
-
-
     // initial metrics (weights may be zero-initialized)
-    std::vector<float> hW(n_features);
-    cudaMemcpy(hW.data(), d_x, n_features * sizeof(float), cudaMemcpyDeviceToHost);
+    std::vector<float> h_w(n_features);
+    cudaMemcpy(h_w.data(), d_x, n_features * sizeof(float), cudaMemcpyDeviceToHost);
     int m_unpadded = total_samples;
     double prev_obj = 0.0;
     double cur_obj = 0.0;
     double cur_acc = 0.0;
-    compute_metrics(h_A, h_y, hW, total_samples, n_features, m_unpadded, prev_obj, cur_acc);
+    compute_metrics(h_A, h_y, h_w, total_samples, n_features, m_unpadded, prev_obj, cur_acc);
 
     cublasHandle_t handle;
     cublasCreate(&handle);
     float neglr = -lr;
 
-    int iters = 0;
-    for (int iter = 0; iter < maxiters; iter++) {
-
-        int b = iter % num_batches;
-
-        float* batch_A = d_A + b * samples_per_step * n_features;
-        float* batch_y = d_y + b * samples_per_step;
+    for (int iters = 0; iters <= maxiters; iters += s) {
+        float* batch_A = d_A + ((iters * batch_size) % total_samples) * n_features;
+        float* batch_y = d_y + ((iters * batch_size) % total_samples);
 
         cudaMemset(d_grad, 0, n_features*sizeof(float));
-        compute_sstep_gradient(batch_A, batch_y, d_x, d_grad, batch_size, s, lr, n_features, iter, stats, num_blocks);
-        cublasSaxpy(handle, n_features, &neglr, d_grad, 1, d_x, 1);
+        compute_sstep_gradient(batch_A, batch_y, d_x, d_grad, batch_size, s, lr, n_features, stats);
 
-        iters += s;
+        double weight_update_start = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
+        // Update weights: x = x - lr * grad
+        cublasSaxpy(handle, n_features, &neglr, d_grad, 1, d_x, 1);
+        
+        double weight_update_end = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count() / 1000.0;
+        
+        stats->weight_update_time += weight_update_end - weight_update_start;
+
         if (printerval > 0 && (iters % printerval) == 0) {
             // copy weights and compute metrics
-            cudaMemcpy(hW.data(), d_x, n_features * sizeof(float), cudaMemcpyDeviceToHost);
-            compute_metrics(h_A, h_y, hW, total_samples, n_features, m_unpadded, cur_obj, cur_acc);
+            cudaMemcpy(h_w.data(), d_x, n_features * sizeof(float), cudaMemcpyDeviceToHost);
+            compute_metrics(h_A, h_y, h_w, total_samples, n_features, m_unpadded, cur_obj, cur_acc);
             printf("Iters: %d\t Objective: %.8f\t Training Accuracy: %.4f%%\t Obj val diff %1.15e.\n",
                    iters, cur_obj, cur_acc, fabs(prev_obj - cur_obj));
             prev_obj = cur_obj;
@@ -320,18 +370,16 @@ void train(
 // ---------------- Main ----------------
 int main(int argc, char** argv) {
     // Command-line arguments:
-    //   [batch_size] [s] [num_blocks]
+    //   [batch_size] [s]
     // If any argument is omitted, the default value is used.
     int batch_size = 16;
     int s = 16;
-    int num_blocks = 256;
 
     if (argc > 1) {
         if (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
-            std::cout << "Usage: " << argv[0] << " [batch_size] [s] [num_blocks]\n";
-            std::cout << "  batch_size  : number of samples per minibatch (default 256)\n";
+            std::cout << "Usage: " << argv[0] << " [batch_size] [s]\n";
+            std::cout << "  batch_size  : number of samples per minibatch (default 16)\n";
             std::cout << "  s           : number of minibatches to process before updating weights (default 16)\n";
-            std::cout << "  num_blocks  : number of CUDA blocks used in gram matrix kernel (default 1)\n";
             return 0;
         }
         batch_size = std::max(1, std::atoi(argv[1]));
@@ -339,9 +387,7 @@ int main(int argc, char** argv) {
     if (argc > 2) {
         s = std::max(1, std::atoi(argv[2]));
     }
-    if (argc > 3) {
-        num_blocks = std::max(1, std::atoi(argv[3]));
-    }
+    srand(time(NULL));
 
     // raw data
     // hA each row is a sample(stored contiguously)
@@ -356,24 +402,19 @@ int main(int argc, char** argv) {
     // total samples
     int total_samples = h_y.size();
 
-    // Hyperparameters
-
     // samples per minibatch(we process s minibatches per iteration)
     // int batch_size = 256;
     // s = how many SGD calculations we perform ahead of time(before updating weights)
-    // int s = 16;
     // how many iterations run(=gradient computations) Adjust maxiters since each iteration processes s steps vs normal SGD
-    int maxiters = 15360 / s;
+    int maxiters = 15360;
     float lr = 0.5f;
     int printerval = 512;
 
-    // how many used in the compute gram matrix kernel
-    
     // Pad data to be multiple of s * batch_size
     // samples per iteration
     int samples_per_iter = s * batch_size;
     // calculate extra samples(needed to pad end of dataset to make it divisible by samples_per_iter)
-    int extra_samples = total_samples % samples_per_iter;
+    int extra_samples = samples_per_iter - (total_samples % samples_per_iter);
     for (int i = 0; i < extra_samples; i++) {
         h_y.push_back(0.0f);
         for (int j = 0; j < n_features; j++) {
@@ -394,36 +435,16 @@ int main(int argc, char** argv) {
     cudaMemset(d_x, 0, n_features * sizeof(float));
 
     std::unique_ptr<ProfileStats> hstats = std::make_unique<ProfileStats>();
-    hstats->init_corr_time = 0.0f;
-    hstats->gram_time = std::make_unique<float[]>(maxiters);
-    hstats->recurrence_time = std::make_unique<float[]>(maxiters);
-    
-    
-    train(d_A, d_y, d_x, total_samples, n_features, batch_size, s, maxiters, lr, h_A, h_y, printerval, hstats.get(), num_blocks);
-    
-    // Copy back weights into hW for printing
-    std::vector<float> h_W(n_features);
-    cudaMemcpy(h_W.data(), d_x, n_features * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    // Add this to print weights
-    std::cout << "Final weights:" << std::endl;
-    for (int i = 0; i < n_features; ++i) {
-        std::cout << h_W[i] << "\n";
-    }
-    std::cout << n_features << std::endl;
 
+    train(d_A, d_y, d_x, total_samples, n_features, batch_size, s, maxiters, lr, h_A, h_y, printerval, hstats.get());
+    
+    // Copy back weights into h_x for printing
+    std::vector<float> h_x(n_features);
+    cudaMemcpy(h_x.data(), d_x, n_features * sizeof(float), cudaMemcpyDeviceToHost);
+    
     // Compare final weights to MATLAB reference file
-    compare_with_matlab_weights(h_W, "matlab_w1a.txt");
-
-    /*
-    for (size_t i = 0; i < maxiters; i++) {
-        std::cout << "Recurrence time for block " << (i + 1) << ": " << hstats->recurrence_time[i] << " ms" << std::endl;
-        std::cout << "Gram time for block " << (i + 1) << ": " << hstats->gram_time[i] << " ms" << std::endl;
-    }
-    std::cout << "Total Recurrence time: " << std::accumulate(hstats->recurrence_time.get(), hstats->recurrence_time.get() + maxiters, 0.0f) << " ms" << std::endl;
-    std::cout << "Total Gram time: " << std::accumulate(hstats->gram_time.get(), hstats->gram_time.get() + maxiters, 0.0f) << " ms" << std::endl;
-    */
-    
+    compare_with_matlab_weights(h_x, "matlab_w1a.txt");
+  
     cudaFree(d_A);
     cudaFree(d_y);
     cudaFree(d_x);

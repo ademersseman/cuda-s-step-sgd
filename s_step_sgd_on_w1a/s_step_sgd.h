@@ -4,9 +4,12 @@
 #pragma once
 
 struct ProfileStats {
-    float init_corr_time;
-    std::unique_ptr<float[]> gram_time;
-    std::unique_ptr<float[]> recurrence_time;
+    double init_corr_time = 0.0f;
+    double gram_time = 0.0f;
+    double recurrence_time = 0.0f;
+    double grad_proj_time = 0.0f;
+    double weight_update_time = 0.0f;
+    double scaling_time = 0.0f;
 };
 
 // CUDA wrapper functions callable from host

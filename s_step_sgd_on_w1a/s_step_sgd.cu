@@ -15,7 +15,7 @@ __global__ void apply_sigmoid_kernel(float *correction, int total_samples, int b
     int idx = start + tid;
     if (idx < start + batch_size && idx < total_samples)
     {
-        correction[idx] = 1.0f / (1.0f + expf(correction[idx]));
+        correction[idx] = 1.0f / (1.0f + __expf(correction[idx]));
     }
 }
 
