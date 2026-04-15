@@ -77,7 +77,65 @@ void compute_metrics(
 }
 
 
-bool compare_with_matlab_weights(
+// Compute leverage scores (column norms squared) for importance sampling
+void compute_column_leverage_scores(
+    const DataParams* data_params,
+    const float* d_A_scaled,
+    int n_samples,
+    std::vector<float>& scores)
+{
+    scores.assign(data_params->n_features, 0.0f);
+    std::vector<float> h_A_scaled(n_samples * data_params->n_features);
+    cudaMemcpy(h_A_scaled.data(), d_A_scaled, n_samples * data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // Compute norm squared for each column
+    for (int j = 0; j < data_params->n_features; j++) {
+        float norm_sq = 0.0f;
+        for (int i = 0; i < n_samples; i++) {
+            float val = h_A_scaled[i * data_params->n_features + j];
+            norm_sq += val * val;
+        }
+        scores[j] = norm_sq;
+    }
+    
+    // Normalize scores to probabilities
+    float sum = std::accumulate(scores.begin(), scores.end(), 0.0f);
+    if (sum > 0.0f) {
+        for (auto& score : scores) {
+            score /= sum;
+        }
+    }
+}
+
+// Sample column indices according to weights
+std::vector<int> sample_columns_with_replacement(
+    const std::vector<float>& weights,
+    int num_samples)
+{
+    std::vector<int> sampled;
+    std::vector<float> cumsum(weights.size());
+    
+    // Compute cumulative sum
+    cumsum[0] = weights[0];
+    for (size_t i = 1; i < weights.size(); i++) {
+        cumsum[i] = cumsum[i - 1] + weights[i];
+    }
+    
+    // Sample according to weights
+    for (int i = 0; i < num_samples; i++) {
+        float rand_val = (float)rand() / RAND_MAX;
+        for (size_t j = 0; j < cumsum.size(); j++) {
+            if (rand_val <= cumsum[j]) {
+                sampled.push_back(j);
+                break;
+            }
+        }
+    }
+    
+    return sampled;
+}
+
+bool compare_with_weights(
     const std::vector<float>& h_x,
     const std::string& filename)
 {
@@ -180,36 +238,72 @@ void compute_sstep_gradient(
     
     float *d_A_scaled_sub = nullptr;
     auto gram_start = std::chrono::high_resolution_clock::now();
-    if (s_step_params->approx_gram) {
-        // Approximate Gram matrix using sampling (from Drineas et al. paper)
-        int l = 50; // number of sampled features
-        cudaMalloc(&d_A_scaled_sub, samples_per_iter * l * sizeof(float));
+    if (s_step_params->approx_gram && s_step_params->approx_gram_type == "uniform") {
+        // Approximate Gram matrix using uniform random sampling of columns
+        cudaMalloc(&d_A_scaled_sub, samples_per_iter * s_step_params->approx_gram_l * sizeof(float));
         
-        for(int i = 0; i < l; i++) {
+        for(int i = 0; i < s_step_params->approx_gram_l; i++) {
             int src_col = rand() % data_params->n_features;
             cublasScopy(handle,
                 samples_per_iter,
                 d_A_scaled + src_col, data_params->n_features,
-                d_A_scaled_sub + i, l);
+                d_A_scaled_sub + i, s_step_params->approx_gram_l);
         }
             
         // Compute approximate Gram matrix G_hat = (n_features / l) * A_sub * A_sub^T
         // Both matrices are row-major (total_samples x l).
-        float alpha_approx = data_params->n_features / (float)l;
+        float alpha_approx = s_step_params->approx_gram_l / (float)data_params->n_features;
         cublasSgemm(
             handle,
             CUBLAS_OP_T,
             CUBLAS_OP_N,
             samples_per_iter,
             samples_per_iter,
-            l,
+            s_step_params->approx_gram_l,
             &alpha_approx,
-            d_A_scaled_sub, l,
-            d_A_scaled_sub, l,
+            d_A_scaled_sub, s_step_params->approx_gram_l,
+            d_A_scaled_sub, s_step_params->approx_gram_l,
             &beta,
             d_G, samples_per_iter
             );
-    } else
+    }
+    else if (s_step_params->approx_gram && s_step_params->approx_gram_type == "scoring") { 
+        // Approximate Gram matrix using leverage score-based sampling of columns
+        cudaMalloc(&d_A_scaled_sub, samples_per_iter * s_step_params->approx_gram_l * sizeof(float));
+        
+        // Compute leverage scores (column norms squared)
+        std::vector<float> leverage_scores;
+        compute_column_leverage_scores(data_params, d_A_scaled, samples_per_iter, leverage_scores);
+        
+        // Sample columns according to leverage scores
+        std::vector<int> sampled_cols = sample_columns_with_replacement(leverage_scores, s_step_params->approx_gram_l);
+        
+        for(int i = 0; i < s_step_params->approx_gram_l; i++) {
+            int src_col = sampled_cols[i];
+            cublasScopy(handle,
+                samples_per_iter,
+                d_A_scaled + src_col, data_params->n_features,
+                d_A_scaled_sub + i, s_step_params->approx_gram_l);
+        }
+            
+        // Compute approximate Gram matrix G_hat = (n_features / l) * A_sub * A_sub^T
+        // Both matrices are row-major (total_samples x l).
+        float alpha_approx = s_step_params->approx_gram_l / (float)data_params->n_features;
+        cublasSgemm(
+            handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            samples_per_iter,
+            samples_per_iter,
+            s_step_params->approx_gram_l,
+            &alpha_approx,
+            d_A_scaled_sub, s_step_params->approx_gram_l,
+            d_A_scaled_sub, s_step_params->approx_gram_l,
+            &beta,
+            d_G, samples_per_iter
+            );
+    }
+    else
     {
         // Compute full Gram matrix G = A_scaled * A_scaled'
         cublasSgemm(
@@ -342,7 +436,7 @@ void train(
     // Copy back weights into h_x for comparison
     cudaMemcpy(h_x.data(), d_x, data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
     // Compare final weights to MATLAB reference file
-    compare_with_matlab_weights(h_x, "matlab_w1a.txt");
+    compare_with_weights(h_x, "matlab_w1a.txt");
 
     std::cout << "\n=== Timing Breakdown ===\n";
     std::cout << "Initialization + Correction Time: " << run_stats->init_corr_time << " seconds\n";
@@ -364,17 +458,7 @@ int main(
     // at 16x full gram is 
 
     std::unique_ptr<RunParams> s_step_params = std::make_unique<RunParams>();
-    // samples per minibatch(we process s minibatches per iteration)
-    // s = how many SGD calculations we perform ahead of time(before updating weights)
-    s_step_params->maxiters = 15360;
-    s_step_params->printerval = 15360;
-    s_step_params->batch_size = 16 * 16;
-    s_step_params->s = 16 * 16;
-    s_step_params->eta = 0.5f;
-
     std::unique_ptr<DataParams> data_params = std::make_unique<DataParams>();
-    data_params->n_features = 300;
-    data_params->file_name = "synthetic_w1a.txt";
     
     // Command-line arguments:
     // [batch_size] [s] [training set file name]
@@ -393,6 +477,12 @@ int main(
     }
     if (argc > 3) {
         data_params->file_name = argv[3];
+    }
+    if (argc > 4) {
+        s_step_params->approx_gram_type = argv[4];
+    }
+    if (argc > 5) {
+        s_step_params->approx_gram_l = std::max(1, std::atoi(argv[5]));
     }
     srand(time(NULL));
     
@@ -433,10 +523,10 @@ int main(
     train(data_params.get(), s_step_params.get(), d_A, d_y, d_x, h_A, h_y, run_stats.get());
 
     // reset and run again with approximate gram
-    cudaMemset(d_x, 0, data_params->n_features * sizeof(float));
-    std::unique_ptr<ProfileStats> run_stats_approx = std::make_unique<ProfileStats>();
-    s_step_params->approx_gram = true;
-    train(data_params.get(), s_step_params.get(), d_A, d_y, d_x, h_A, h_y, run_stats_approx.get());
+    // cudaMemset(d_x, 0, data_params->n_features * sizeof(float));
+    // std::unique_ptr<ProfileStats> run_stats_approx = std::make_unique<ProfileStats>();
+    // s_step_params->approx_gram = true;
+    // train(data_params.get(), s_step_params.get(), d_A, d_y, d_x, h_A, h_y, run_stats_approx.get());
 
     cudaFree(d_A);
     cudaFree(d_y);

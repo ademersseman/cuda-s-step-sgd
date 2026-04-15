@@ -20,11 +20,13 @@ struct RunParams {
     float eta = 0.5f;
     int printerval = 512;
     bool approx_gram = false;
+    int approx_gram_l = 64; // number of columns to sample for approximate Gram matrix (if enabled)
+    std::string approx_gram_type = "uniform"; // method for sampling features for approximate Gram matrix ("uniform" or "leverage")
 };
 
 struct DataParams {
-    std::string file_name;
-    int n_features;
+    std::string file_name = "synthetic_w1a.txt";
+    int n_features = 300;
     int total_samples_unpadded;
     int total_samples;
 };
