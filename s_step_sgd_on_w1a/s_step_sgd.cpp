@@ -6,12 +6,12 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <curand.h>
 #include "s_step_sgd.h"
 #include <cmath>
 #include <limits>
 #include <memory>
 #include <numeric>
-#include <chrono>
 #include <cstdlib>
 #include <ctime>
 
@@ -48,6 +48,7 @@ void load_libsvm(
         }
     }
 }
+
 // helper to compute objective and accuracy on host
 void compute_metrics(
     const DataParams* data_params,
@@ -135,123 +136,109 @@ std::vector<int> sample_columns_with_replacement(
     return sampled;
 }
 
-bool compare_with_weights(
-    const std::vector<float>& h_x,
-    const std::string& filename)
-{
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error: Cannot open matlab weights file '" << filename << "'\n";
-        return false;
-    }
-    std::vector<float> matlab;
-    float value;
-    while (file >> value) {
-        matlab.push_back(value);
-    }
-    file.close();
-
-    if (matlab.empty()) {
-        std::cerr << "Error: matlab weights file '" << filename << "' is empty or not formatted as floats.\n";
-        return false;
-    }
-
-    int n = std::min(h_x.size(), matlab.size());
-    float sum_abs_diff = 0.0;
-    float max_diff = 0.0;
-    float min_diff = std::numeric_limits<float>::infinity();
-    float max_matlab = -std::numeric_limits<float>::infinity();
-    float min_matlab = std::numeric_limits<float>::infinity();
-    float max_ours = -std::numeric_limits<float>::infinity();
-    float min_ours = std::numeric_limits<float>::infinity();
-
-    for (int i = 0; i < n; ++i) {
-        float diff = std::abs(h_x[i] - matlab[i]);
-        sum_abs_diff += diff;
-        max_diff = std::max(max_diff, diff);
-        min_diff = std::min(min_diff, diff);
-        max_matlab = std::max(max_matlab, matlab[i]);
-        min_matlab = std::min(min_matlab, matlab[i]);
-        max_ours = std::max(max_ours, h_x[i]);
-        min_ours = std::min(min_ours, h_x[i]);
-    }
-
-    float avg_diff = sum_abs_diff / n;
-    float range_matlab = max_matlab - min_matlab;
-    float range_ours = max_ours - min_ours;
-
-    std::cout << "=== Weight comparison with " << filename << " ===\n";
-    std::cout << "Matched entries: " << n << " (matlab file length: " << matlab.size() << ", ours length: " << h_x.size() << ")\n";
-    std::cout << "Matlab range: [" << min_matlab << ", " << max_matlab << "] (" << range_matlab << ")\n";
-    std::cout << "Our range:    [" << min_ours << ", " << max_ours << "] (" << range_ours << ")\n";
-    std::cout << "Average absolute difference: " << avg_diff << "\n";
-    std::cout << "Max absolute difference: " << max_diff << "\n";
-    std::cout << "Min absolute difference: " << min_diff << "\n";
-
-    if (matlab.size() != h_x.size()) {
-        std::cout << "Note: size mismatch; only compared first " << n << " elements.";
-    }
-
-    return true;
-}
-
 void compute_sstep_gradient(
-    const DataParams* data_params,
-    const RunParams* s_step_params, 
+    const DataParams *data_params,
+    const RunParams *s_step_params, 
     float *d_A, 
     float *d_y, 
     float *d_x, 
     float *d_grad, 
     ProfileStats *run_stats) 
 {
-    int samples_per_iter = s_step_params->s * s_step_params->batch_size;
+    size_t samples_per_iter = s_step_params->s * s_step_params->batch_size;
 
     float *d_A_scaled;
+    float *d_A_scaled_sub;
     float *d_correction;
     float *d_G;
     cudaMalloc(&d_A_scaled, samples_per_iter * data_params->n_features * sizeof(float));
+    cudaMalloc(&d_A_scaled_sub, samples_per_iter * s_step_params->approx_gram_l * sizeof(float));
     cudaMalloc(&d_correction, samples_per_iter * sizeof(float));
     cudaMalloc(&d_G, samples_per_iter * samples_per_iter * sizeof(float));
 
     cublasHandle_t handle;
     cublasCreate(&handle);
+    /*
+    std::vector<cudaStream_t> streams(s_step_params->approx_gram_l);
+    for (int i = 0; i < s_step_params->approx_gram_l; i++)
+    cudaStreamCreate(&streams[i]);
+    
+    // Create one cuBLAS handle per stream
+    std::vector<cublasHandle_t> handles(s_step_params->approx_gram_l);
+    for (int i = 0; i < s_step_params->approx_gram_l; i++) {
+        cublasCreate(&handles[i]);
+        cublasSetStream(handles[i], streams[i]);
+    }
+    */
+
+
     float alpha = 1;
     float beta = 0;
     
-    auto scaling_start = std::chrono::high_resolution_clock::now();
+    CudaRegionTimer scaling_timer;
+    scaling_timer.begin();
 
     // Scale A by y
     cublasSdgmm(handle, CUBLAS_SIDE_RIGHT, data_params->n_features, samples_per_iter, d_A, data_params->n_features, d_y, 1, d_A_scaled, data_params->n_features);
 
-    auto scaling_end = std::chrono::high_resolution_clock::now();
-    
-    run_stats->scaling_time += std::chrono::duration<double>(scaling_end - scaling_start).count();
+    run_stats->scaling_time += scaling_timer.end();
 
-    auto corr_start = std::chrono::high_resolution_clock::now();
+    /*
+    // Launch all copies concurrently  
+    CudaRegionTimer gram_overhead_timer;
+    gram_overhead_timer.begin();  
+    for (int i = 0; i < s_step_params->approx_gram_l; i++) {
+        int src_col = rand() % data_params->n_features;
+        cublasScopy(handles[i],
+        samples_per_iter,
+        d_A_scaled + src_col, data_params->n_features,
+        d_A_scaled_sub + i,   s_step_params->approx_gram_l);
+    }
+    */
+
+    CudaRegionTimer corr_timer;
+    corr_timer.begin();
     
     // Compute initial correction = A_scaled * x
     cublasSgemv(handle, CUBLAS_OP_T, data_params->n_features, samples_per_iter, &alpha, d_A_scaled, data_params->n_features, d_x, 1, &beta, d_correction, 1);
     
-    auto corr_end = std::chrono::high_resolution_clock::now();
+    run_stats->init_corr_time += corr_timer.end();
     
-    run_stats->init_corr_time += std::chrono::duration<double>(corr_end - corr_start).count();
-    
-    float *d_A_scaled_sub = nullptr;
-    auto gram_start = std::chrono::high_resolution_clock::now();
+    CudaRegionTimer gram_compute_timer;
     if (s_step_params->approx_gram && s_step_params->approx_gram_type == "uniform") {
         // Approximate Gram matrix using uniform random sampling of columns
-        cudaMalloc(&d_A_scaled_sub, samples_per_iter * s_step_params->approx_gram_l * sizeof(float));
+
+        // Compute approximate Gram matrix G_hat = (n_features / l) * A_sub * A_sub^T
+        // Both matrices are row-major (total_samples x l).
+
+        CudaRegionTimer gram_overhead_timer;
+        gram_overhead_timer.begin();
         
         for(int i = 0; i < s_step_params->approx_gram_l; i++) {
             int src_col = rand() % data_params->n_features;
             cublasScopy(handle,
-                samples_per_iter,
-                d_A_scaled + src_col, data_params->n_features,
-                d_A_scaled_sub + i, s_step_params->approx_gram_l);
+            samples_per_iter,
+            d_A_scaled + src_col, data_params->n_features,
+            d_A_scaled_sub + i, s_step_params->approx_gram_l);
         }
-            
-        // Compute approximate Gram matrix G_hat = (n_features / l) * A_sub * A_sub^T
-        // Both matrices are row-major (total_samples x l).
+        
+        
+        
+        /*
+        // Sync all streams before sgemm uses d_A_scaled_sub
+        cudaDeviceSynchronize();
+        std::vector<float> overhead_times(s_step_params->approx_gram_l);
+        for (int i = 0; i < s_step_params->approx_gram_l; i++) {
+            overhead_times[i] = overhead_timers[i].end(streams[i]);  // End on default stream
+        }
+        
+        run_stats->gram_overhead_time += *std::max_element(overhead_times.begin(), overhead_times.end()); // gram_overhead_timer.end();
+        */
+        
+        cudaDeviceSynchronize(); // Ensure all copies are done before we proceed to sgemm
+        run_stats->gram_overhead_time += gram_overhead_timer.end();
+
+        gram_compute_timer.begin();
         float alpha_approx = s_step_params->approx_gram_l / (float)data_params->n_features;
         cublasSgemm(
             handle,
@@ -269,7 +256,6 @@ void compute_sstep_gradient(
     }
     else if (s_step_params->approx_gram && s_step_params->approx_gram_type == "scoring") { 
         // Approximate Gram matrix using leverage score-based sampling of columns
-        cudaMalloc(&d_A_scaled_sub, samples_per_iter * s_step_params->approx_gram_l * sizeof(float));
         
         // Compute leverage scores (column norms squared)
         std::vector<float> leverage_scores;
@@ -285,7 +271,7 @@ void compute_sstep_gradient(
                 d_A_scaled + src_col, data_params->n_features,
                 d_A_scaled_sub + i, s_step_params->approx_gram_l);
         }
-            
+        
         // Compute approximate Gram matrix G_hat = (n_features / l) * A_sub * A_sub^T
         // Both matrices are row-major (total_samples x l).
         float alpha_approx = s_step_params->approx_gram_l / (float)data_params->n_features;
@@ -306,6 +292,7 @@ void compute_sstep_gradient(
     else
     {
         // Compute full Gram matrix G = A_scaled * A_scaled'
+        gram_compute_timer.begin();
         cublasSgemm(
             handle,
             CUBLAS_OP_T,
@@ -320,10 +307,11 @@ void compute_sstep_gradient(
             d_G, samples_per_iter
             );
     }
-    auto gram_end = std::chrono::high_resolution_clock::now();
-    run_stats->gram_time += std::chrono::duration<double>(gram_end - gram_start).count();
+
+    run_stats->gram_compute_time += gram_compute_timer.end();
         
-    auto recurrence_start = std::chrono::high_resolution_clock::now();
+    CudaRegionTimer recurrence_timer;
+    recurrence_timer.begin();
            
     // Apply corrections for each block i from 1 to s-1
     for (int i = 0; i < s_step_params->s; i++) {
@@ -340,11 +328,10 @@ void compute_sstep_gradient(
         cuda_apply_sigmoid_block(d_correction, samples_per_iter, s_step_params->batch_size, i);
     }
   
-    auto recurrence_end = std::chrono::high_resolution_clock::now();
+    run_stats->recurrence_time += recurrence_timer.end();
 
-    run_stats->recurrence_time += std::chrono::duration<double>(recurrence_end - recurrence_start).count();
-
-    auto grad_proj_start = std::chrono::high_resolution_clock::now();
+    CudaRegionTimer grad_proj_timer;
+    grad_proj_timer.begin();
 
     float negalpha = -1.0f;
     
@@ -364,17 +351,17 @@ void compute_sstep_gradient(
         1
     );
 
-    auto grad_proj_end = std::chrono::high_resolution_clock::now();
-
-    run_stats->grad_proj_time += std::chrono::duration<double>(grad_proj_end - grad_proj_start).count();
+    run_stats->grad_proj_time += grad_proj_timer.end();
 
     cublasDestroy(handle);
+    for (int i = 0; i < s_step_params->approx_gram_l; i++) {
+        cublasDestroy(handles[i]);
+        cudaStreamDestroy(streams[i]);
+    }
     cudaFree(d_A_scaled);
+    cudaFree(d_A_scaled_sub);
     cudaFree(d_correction);
     cudaFree(d_G);
-    if (d_A_scaled_sub != nullptr) {
-        cudaFree(d_A_scaled_sub);
-    }
 }
 
 // ---------------- Train Function ----------------
@@ -401,32 +388,36 @@ void train(
 
     cublasHandle_t handle;
     cublasCreate(&handle);
+
     float negEta = -s_step_params->eta;
 
-    for (int iters = 0; iters <= s_step_params->maxiters; iters += s_step_params->s) {
-        // Determine current batch start offset (wrap around if we exceed total samples)
-        int curr_batch_start_offset = ((iters * s_step_params->batch_size) % data_params->total_samples);
+    for (int iters = 0; iters <= s_step_params->maxiters; iters++) {
+        // determine current batch start offset (wrap around if we exceed total samples)
+        int curr_batch_start_offset = ((iters * s_step_params->batch_size * s_step_params->s) % data_params->total_samples);
         float* batch_A = d_A + curr_batch_start_offset * data_params->n_features;
         float* batch_y = d_y + curr_batch_start_offset;
 
         cudaMemset(d_grad, 0, data_params->n_features * sizeof(float));
+        
+        CudaRegionTimer iter_timer;
+        iter_timer.begin();
+        
         compute_sstep_gradient(data_params, s_step_params, batch_A, batch_y, d_x, d_grad, run_stats);
 
-        auto weight_update_start = std::chrono::high_resolution_clock::now();
+        CudaRegionTimer weight_update_timer;
+        weight_update_timer.begin();
 
-        // Update weights: x = x - lr * grad
+        // update weights: x = x - lr * grad
         cublasSaxpy(handle, data_params->n_features, &negEta, d_grad, 1, d_x, 1);
         
-        auto weight_update_end = std::chrono::high_resolution_clock::now();
-        
-        run_stats->weight_update_time += std::chrono::duration<double>(weight_update_end - weight_update_start).count();
+        run_stats->weight_update_time += weight_update_timer.end();
 
-        if (s_step_params->printerval > 0 && (iters % s_step_params->printerval) == 0) {
+        if (iters % s_step_params->printerval == 0) {
             // copy weights and compute metrics
             cudaMemcpy(h_x.data(), d_x, data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
             compute_metrics(data_params, h_A, h_y, h_x, cur_obj, cur_acc);
-            printf("Iters: %d\t Objective: %.8f\t Training Accuracy: %.4f%%\t Obj val diff %1.15e.\n",
-                   iters, cur_obj, cur_acc, fabs(prev_obj - cur_obj));
+            printf("Iters: %d\t Objective: %.4f\t Training Accuracy: %.4f%%\t Obj val diff: %1.10e\t Time: %.4f\n",
+                   iters, cur_obj, cur_acc, fabs(prev_obj - cur_obj), iter_timer.end());
             prev_obj = cur_obj;
         }
     }
@@ -435,16 +426,6 @@ void train(
 
     // Copy back weights into h_x for comparison
     cudaMemcpy(h_x.data(), d_x, data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
-    // Compare final weights to MATLAB reference file
-    compare_with_weights(h_x, "matlab_w1a.txt");
-
-    std::cout << "\n=== Timing Breakdown ===\n";
-    std::cout << "Initialization + Correction Time: " << run_stats->init_corr_time << " seconds\n";
-    std::cout << "Gram Matrix Time: " << run_stats->gram_time << " seconds\n";
-    std::cout << "Recurrence Time: " << run_stats->recurrence_time << " seconds\n";
-    std::cout << "Gradient Projection Time: " << run_stats->grad_proj_time << " seconds\n";
-    std::cout << "Weight Update Time: " << run_stats->weight_update_time << " seconds\n";
-    std::cout << "Scaling Time: " << run_stats->scaling_time << " seconds\n\n";
 }
 
 // ---------------- Main ----------------
@@ -452,11 +433,6 @@ int main(
     int argc, 
     char** argv) 
 {
-    // at 1x full gram is ~30x faster vs approximate gram
-    // at 4x full gram is ~14x faster vs approximate gram
-    // at 8x full gram is ~13x faster vs approximate gram
-    // at 16x full gram is 
-
     std::unique_ptr<RunParams> s_step_params = std::make_unique<RunParams>();
     std::unique_ptr<DataParams> data_params = std::make_unique<DataParams>();
     
@@ -466,7 +442,8 @@ int main(
         if (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
             std::cout << "Usage: " << argv[0] << " [batch_size] [s] [training set file name]\n";
             std::cout << "  batch_size   : number of samples per minibatch (default 16)\n";
-            std::cout << "  s            : number of minibatches to process before updating weights (default 16)\n";
+            std::cout << "  s            : number of minibatches to process before updating weights (default 4)\n";
+            std::cout << "  epochs       : number of passes over dataset to process (default 1)\n";
             std::cout << "  training set : file name of training dataset (default 'w1a.txt')\n";
             return 0;
         }
@@ -476,16 +453,22 @@ int main(
         s_step_params->s = std::max(1, std::atoi(argv[2]));
     }
     if (argc > 3) {
-        data_params->file_name = argv[3];
+	s_step_params->epochs = std::max(1, std::atoi(argv[3]));
     }
     if (argc > 4) {
-        s_step_params->approx_gram_type = argv[4];
+        data_params->file_name = argv[4];
     }
     if (argc > 5) {
-        s_step_params->approx_gram_l = std::max(1, std::atoi(argv[5]));
+	s_step_params->approx_gram = true;
+        s_step_params->approx_gram_type = argv[5];
+    }
+    if (argc > 6) {
+        s_step_params->approx_gram_l = std::max(1, std::atoi(argv[6]));
     }
     srand(time(NULL));
-    
+
+    std::cout << "batch_size: " << s_step_params->batch_size << ", s: " << s_step_params->s << ", epochs: " << s_step_params->epochs << ", training_set: " << data_params->file_name << ", approx_gram_type: " << s_step_params->approx_gram_type << ", approx_gram_l: " << s_step_params->approx_gram_l << "\n";
+
     // load raw data
     std::vector<float> h_A, h_y;
     load_libsvm(data_params.get(), h_A, h_y);
@@ -503,6 +486,10 @@ int main(
     }
     data_params->total_samples = h_y.size();
 
+    // calculate number of iterations based on epochs and padded total samples
+    s_step_params->maxiters = s_step_params->epochs * data_params->total_samples / samples_per_iter;
+    s_step_params->printerval = data_params->total_samples / samples_per_iter;
+
     if (s_step_params->batch_size * s_step_params->s > data_params->total_samples) {
         std::cerr << "Error: batch_size * s must be <= total_samples\n";
         return 1;
@@ -513,26 +500,33 @@ int main(
     cudaMalloc(&d_A, data_params->total_samples * data_params->n_features * sizeof(float));
     cudaMalloc(&d_y, data_params->total_samples * sizeof(float));
     cudaMalloc(&d_x, data_params->n_features * sizeof(float));
+
     cudaMemcpy(d_A, h_A.data(), data_params->total_samples * data_params->n_features * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_y, h_y.data(), data_params->total_samples * sizeof(float), cudaMemcpyHostToDevice);
-    // set initial weights to zero
     cudaMemset(d_x, 0, data_params->n_features * sizeof(float));
 
     std::unique_ptr<ProfileStats> run_stats = std::make_unique<ProfileStats>();
 
+    CudaRegionTimer training_timer;
+    training_timer.begin();
+
     train(data_params.get(), s_step_params.get(), d_A, d_y, d_x, h_A, h_y, run_stats.get());
 
-    // reset and run again with approximate gram
-    // cudaMemset(d_x, 0, data_params->n_features * sizeof(float));
-    // std::unique_ptr<ProfileStats> run_stats_approx = std::make_unique<ProfileStats>();
-    // s_step_params->approx_gram = true;
-    // train(data_params.get(), s_step_params.get(), d_A, d_y, d_x, h_A, h_y, run_stats_approx.get());
+    run_stats->training_time = training_timer.end();
+
+    std::cout << "\n=== Timing Breakdown ===\n";
+    std::cout << "Initialization + Correction Time: " << run_stats->init_corr_time << " ms\n";
+    std::cout << "Gram Overhead Time: " << run_stats->gram_overhead_time << " ms\n";
+    std::cout << "Gram Compute Time: " << run_stats->gram_compute_time << " ms\n";
+    std::cout << "Recurrence Time: " << run_stats->recurrence_time << " ms\n";
+    std::cout << "Gradient Projection Time: " << run_stats->grad_proj_time << " ms\n";
+    std::cout << "Weight Update Time: " << run_stats->weight_update_time << " ms\n";
+    std::cout << "Scaling Time: " << run_stats->scaling_time << " ms\n";
+    std::cout << "Training Time: " << run_stats->training_time << " ms\n\n";
 
     cudaFree(d_A);
     cudaFree(d_y);
     cudaFree(d_x);
 
-    std::cout << "Press Enter to exit..." << std::endl;
-    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     return 0;
 }
