@@ -1,8 +1,8 @@
 #include <vector>
 #include <memory>
+#include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <string>
-#pragma once
 
 struct ProfileStats {
     float init_corr_time = 0.0f;
@@ -18,6 +18,7 @@ struct ProfileStats {
 struct RunParams {
     int batch_size = 16;
     int s = 4;
+    int samples_per_iter = batch_size * s;
     int epochs = 10;
     int maxiters = 65536;
     float eta = 0.5f;
@@ -60,24 +61,55 @@ struct CudaRegionTimer {
     }
 };
 
+struct Workspace {
+    float *d_A;
+    float *d_y;
+    float *d_x;
+
+    float *d_A_scaled;
+    float *d_batch_A_approx;
+    float *d_correction;
+    float *d_G;
+    float *d_grad;
+    cublasHandle_t handle;
+
+    Workspace(const DataParams* data_params, const RunParams* s_step_params)  {
+        cudaMalloc(&d_A, data_params->total_samples * data_params->n_features * sizeof(float));
+        cudaMalloc(&d_y, data_params->total_samples * sizeof(float));
+        cudaMalloc(&d_x, data_params->n_features * sizeof(float));
+
+        cudaMalloc(&d_A_scaled, data_params->total_samples * data_params->n_features * sizeof(float));
+        cudaMalloc(&d_batch_A_approx, s_step_params->samples_per_iter * s_step_params->approx_gram_l * sizeof(float));
+        cudaMalloc(&d_correction, s_step_params->samples_per_iter * sizeof(float));
+        cudaMalloc(&d_G, s_step_params->samples_per_iter * s_step_params->samples_per_iter * sizeof(float));
+        cudaMalloc(&d_grad, data_params->n_features * sizeof(float));
+        cublasCreate(&handle);
+    }
+
+    ~Workspace() {
+        cudaFree(d_A);
+        cudaFree(d_y);
+        cudaFree(d_x);
+
+        cudaFree(d_A_scaled);
+        cudaFree(d_batch_A_approx);
+        cudaFree(d_correction);
+        cudaFree(d_G);
+        cudaFree(d_grad);
+        cublasDestroy(handle);
+    }
+};
+
 // CUDA wrapper functions callable from host
-void compute_sstep_gradient(DataParams* data_params, RunParams* s_step_params, float* A, float* y, float* x, float* grad, ProfileStats* stats);
+void compute_sstep_gradient(const DataParams *data_params, const RunParams *s_step_params, Workspace *workspace, float* A, ProfileStats* stats);
 void cuda_apply_sigmoid_block(float *correction, int total_samples, int batch_size, int block_idx);
 void cuda_compute_gram_uniform_approx(float *d_A_scaled, int *d_sampled_cols, float *d_G, int samples_per_iter, int n_features, int l);
 
-// Optional: train function declaration if needed elsewhere
 void train(
-    float* d_A,
-    float* d_y,
-    float* d_x,
-    int n_samples,
-    int n_features,
-    int batch_size,
-    int s,
-    int maxiters,
-    float lr,
-    const std::vector<float>& hA,
-    const std::vector<float>& hy,
-    int print_interval,
+    const DataParams* data_params,
+    const RunParams* s_step_params,
+    Workspace* workspace,
+    const std::vector<float>& h_A,
+    const std::vector<float>& h_y,
     ProfileStats* stats
 );
