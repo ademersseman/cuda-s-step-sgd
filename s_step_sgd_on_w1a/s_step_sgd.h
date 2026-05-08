@@ -67,11 +67,23 @@ struct Workspace {
     float *d_x;
 
     float *d_A_scaled;
-    float *d_batch_A_approx;
+    float *d_batch_A_approx[2];
     float *d_correction;
-    float *d_G;
+    float *d_G[2];
     float *d_grad;
+
+    float* d_scores;   // [n_features]
+    std::vector<std::vector<float>> score_cache; // [num_iters][n_features] — host cache of scores for debugging
+    std::vector<bool> cache_valid; // [num_iters] — whether the corresponding row in score_cache is valid
+
     cublasHandle_t handle;
+    cublasHandle_t prefetch_handle;   // handle bound to prefetch stream
+    cudaStream_t   prefetch_stream;
+    cudaEvent_t    gram_overhead_prefetch_done;     // signals when buffer is ready
+    cudaEvent_t    gram_prefetch_done;     // signals when buffer is ready
+    int            prefetch_buf = 0;  // which buffer the prefetch wrote into
+    int            compute_buf  = 0;  // which buffer compute should read from
+
 
     Workspace(const DataParams* data_params, const RunParams* s_step_params)  {
         cudaMalloc(&d_A, data_params->total_samples * data_params->n_features * sizeof(float));
@@ -79,11 +91,23 @@ struct Workspace {
         cudaMalloc(&d_x, data_params->n_features * sizeof(float));
 
         cudaMalloc(&d_A_scaled, data_params->total_samples * data_params->n_features * sizeof(float));
-        cudaMalloc(&d_batch_A_approx, s_step_params->samples_per_iter * s_step_params->approx_gram_l * sizeof(float));
+        cudaMalloc(&d_batch_A_approx[0], s_step_params->samples_per_iter * s_step_params->approx_gram_l * sizeof(float));
+        cudaMalloc(&d_batch_A_approx[1], s_step_params->samples_per_iter * s_step_params->approx_gram_l * sizeof(float));
         cudaMalloc(&d_correction, s_step_params->samples_per_iter * sizeof(float));
-        cudaMalloc(&d_G, s_step_params->samples_per_iter * s_step_params->samples_per_iter * sizeof(float));
+        cudaMalloc(&d_G[0], s_step_params->samples_per_iter * s_step_params->samples_per_iter * sizeof(float));
+        cudaMalloc(&d_G[1], s_step_params->samples_per_iter * s_step_params->samples_per_iter * sizeof(float));
         cudaMalloc(&d_grad, data_params->n_features * sizeof(float));
+
+        cudaMalloc(&d_scores, data_params->n_features * sizeof(float));
+        score_cache = std::vector<std::vector<float>>(data_params->total_samples / s_step_params->samples_per_iter, std::vector<float>(data_params->n_features));
+        cache_valid = std::vector<bool>(data_params->total_samples / s_step_params->samples_per_iter, false);
+
         cublasCreate(&handle);
+        cudaStreamCreate(&prefetch_stream);
+        cublasCreate(&prefetch_handle);
+        cublasSetStream(prefetch_handle, prefetch_stream);
+        cudaEventCreateWithFlags(&gram_overhead_prefetch_done, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&gram_prefetch_done, cudaEventDisableTiming);
     }
 
     ~Workspace() {
@@ -92,11 +116,20 @@ struct Workspace {
         cudaFree(d_x);
 
         cudaFree(d_A_scaled);
-        cudaFree(d_batch_A_approx);
+        cudaFree(d_batch_A_approx[0]);
+        cudaFree(d_batch_A_approx[1]);
         cudaFree(d_correction);
-        cudaFree(d_G);
+        cudaFree(d_G[0]);
+        cudaFree(d_G[1]);
         cudaFree(d_grad);
+
+        cudaFree(d_scores);
+
         cublasDestroy(handle);
+        cublasDestroy(prefetch_handle);
+        cudaStreamDestroy(prefetch_stream);
+        cudaEventDestroy(gram_prefetch_done);
+        cudaEventDestroy(gram_overhead_prefetch_done);
     }
 };
 

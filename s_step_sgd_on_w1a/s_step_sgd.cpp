@@ -77,37 +77,6 @@ void compute_metrics(
     accuracy_out = 100.0 * correct / (double)data_params->total_samples_unpadded;
 }
 
-
-// Compute leverage scores (column norms squared) for importance sampling
-void compute_column_leverage_scores(
-    const DataParams* data_params,
-    const float* d_batch_A,
-    int n_samples,
-    std::vector<float>& scores)
-{
-    scores.assign(data_params->n_features, 0.0f);
-    std::vector<float> h_A_batch(n_samples * data_params->n_features);
-    cudaMemcpy(h_A_batch.data(), d_batch_A, n_samples * data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    // Compute norm squared for each column
-    for (int j = 0; j < data_params->n_features; j++) {
-        float norm_sq = 0.0f;
-        for (int i = 0; i < n_samples; i++) {
-            float val = h_A_batch[i * data_params->n_features + j];
-            norm_sq += val * val;
-        }
-        scores[j] = norm_sq;
-    }
-    
-    // Normalize scores to probabilities
-    float sum = std::accumulate(scores.begin(), scores.end(), 0.0f);
-    if (sum > 0.0f) {
-        for (auto& score : scores) {
-            score /= sum;
-        }
-    }
-}
-
 // Sample column indices according to weights
 std::vector<int> sample_columns_with_replacement(
     const std::vector<float>& weights,
@@ -136,158 +105,24 @@ std::vector<int> sample_columns_with_replacement(
     return sampled;
 }
 
-void compute_sstep_gradient(
+void enter_recurrence(
     const DataParams *data_params,
     const RunParams *s_step_params,
     Workspace *workspace,
     float *d_batch_A, 
     ProfileStats *run_stats) 
-{
-    cublasHandle_t& handle = workspace->handle;
-    std::vector<cudaStream_t> streams(s_step_params->approx_gram_l);
-    for (int i = 0; i < s_step_params->approx_gram_l; i++)
-        cudaStreamCreate(&streams[i]);
-    
-    // Create one cuBLAS handle per stream
-    std::vector<cublasHandle_t> handles(s_step_params->approx_gram_l);
-    for (int i = 0; i < s_step_params->approx_gram_l; i++) {
-        cublasCreate(&handles[i]);
-        cublasSetStream(handles[i], streams[i]);
-    }
-
+{    
     float alpha = 1;
     float beta = 0;
-    
-    /*
-    // Launch all copies concurrently  
-    CudaRegionTimer gram_overhead_timer;
-    gram_overhead_timer.begin();  
-    for (int i = 0; i < s_step_params->approx_gram_l; i++) {
-        int src_col = rand() % data_params->n_features;
-        cublasScopy(handles[i],
-        s_step_params->samples_per_iter,
-        d_batch_A + src_col, data_params->n_features,
-        d_batch_A_approx + i,   s_step_params->approx_gram_l);
-    }
-    */
-    
+        
     CudaRegionTimer corr_timer;
     corr_timer.begin();
     
     // Compute initial correction = A_scaled * x
-    cublasSgemv(handle, CUBLAS_OP_T, data_params->n_features, s_step_params->samples_per_iter, &alpha, d_batch_A, data_params->n_features, workspace->d_x, 1, &beta, workspace->d_correction, 1);
+    cublasSgemv(workspace->handle, CUBLAS_OP_T, data_params->n_features, s_step_params->samples_per_iter, &alpha, d_batch_A, data_params->n_features, workspace->d_x, 1, &beta, workspace->d_correction, 1);
     
     run_stats->init_corr_time += corr_timer.end();
-    
-    CudaRegionTimer gram_compute_timer;
-    if (s_step_params->approx_gram && s_step_params->approx_gram_type == "uniform") {
-        // Approximate Gram matrix using uniform random sampling of columns
-
-        // Compute approximate Gram matrix G_hat = (n_features / l) * A_sub * A_sub^T
-        // Both matrices are row-major (total_samples x l).
-        /*
-        CudaRegionTimer gram_overhead_timer;
-        gram_overhead_timer.begin();
-        
-        // Sync all streams before sgemm uses d_batch_A_approx
-        cudaDeviceSynchronize();
-        std::vector<float> overhead_times(s_step_params->approx_gram_l);
-        for (int i = 0; i < s_step_params->approx_gram_l; i++) {
-            overhead_times[i] = overhead_timers[i].end(streams[i]);  // End on default stream
-        }
-        
-        run_stats->gram_overhead_time += *std::max_element(overhead_times.begin(), overhead_times.end()); // gram_overhead_timer.end();
-        */
-        
-        //cudaDeviceSynchronize(); // Ensure all copies are done before we proceed to sgemm
-        /*
-        */
-        
-        CudaRegionTimer gram_overhead_timer;
-        gram_overhead_timer.begin();
-
-        for (int i = 0; i < s_step_params->approx_gram_l; i++) {
-            int src_col = rand() % data_params->n_features;
-            cublasScopy(handle,
-            s_step_params->samples_per_iter,
-            d_batch_A + src_col, data_params->n_features,
-            workspace->d_batch_A_approx + i,   s_step_params->approx_gram_l);
-        }
-        
-        run_stats->gram_overhead_time += gram_overhead_timer.end();
-
-        gram_compute_timer.begin();
-        float alpha_approx = s_step_params->approx_gram_l / (float)data_params->n_features;
-        cublasSgemm(
-            handle,
-            CUBLAS_OP_T,
-            CUBLAS_OP_N,
-            s_step_params->samples_per_iter,
-            s_step_params->samples_per_iter,
-            s_step_params->approx_gram_l,
-            &alpha_approx,
-            workspace->d_batch_A_approx, s_step_params->approx_gram_l,
-            workspace->d_batch_A_approx, s_step_params->approx_gram_l,
-            &beta,
-            workspace->d_G, s_step_params->samples_per_iter
-            );
-    }
-    else if (s_step_params->approx_gram && s_step_params->approx_gram_type == "scoring") { 
-        // Approximate Gram matrix using leverage score-based sampling of columns
-        
-        // Compute leverage scores (column norms squared)
-        std::vector<float> leverage_scores;
-        compute_column_leverage_scores(data_params, d_batch_A, s_step_params->samples_per_iter, leverage_scores);
-        
-        // Sample columns according to leverage scores
-        std::vector<int> sampled_cols = sample_columns_with_replacement(leverage_scores, s_step_params->approx_gram_l);
-        
-        for(int i = 0; i < s_step_params->approx_gram_l; i++) {
-            int src_col = sampled_cols[i];
-            cublasScopy(handle,
-                s_step_params->samples_per_iter,
-                d_batch_A + src_col, data_params->n_features,
-                workspace->d_batch_A_approx + i, s_step_params->approx_gram_l);
-        }
-        
-        // Compute approximate Gram matrix G_hat = (n_features / l) * A_sub * A_sub^T
-        // Both matrices are row-major (total_samples x l).
-        float alpha_approx = s_step_params->approx_gram_l / (float)data_params->n_features;
-        cublasSgemm(
-            handle,
-            CUBLAS_OP_T,
-            CUBLAS_OP_N,
-            s_step_params->samples_per_iter,
-            s_step_params->samples_per_iter,
-            s_step_params->approx_gram_l,
-            &alpha_approx,
-            workspace->d_batch_A_approx, s_step_params->approx_gram_l,
-            workspace->d_batch_A_approx, s_step_params->approx_gram_l,
-            &beta,
-            workspace->d_G, s_step_params->samples_per_iter
-            );
-    }
-    else
-    {
-        // Compute full Gram matrix G = A_scaled * A_scaled'
-        gram_compute_timer.begin();
-        cublasSgemm(
-            handle,
-            CUBLAS_OP_T,
-            CUBLAS_OP_N,
-            s_step_params->samples_per_iter,
-            s_step_params->samples_per_iter,
-            data_params->n_features,
-            &alpha,
-            d_batch_A, data_params->n_features,
-            d_batch_A, data_params->n_features,
-            &beta,
-            workspace->d_G, s_step_params->samples_per_iter
-            );
-    }
-
-    run_stats->gram_compute_time += gram_compute_timer.end();
-        
+            
     CudaRegionTimer recurrence_timer;
     recurrence_timer.begin();
            
@@ -298,10 +133,10 @@ void compute_sstep_gradient(
         for (int j = 0; j < i; j++)
         {
             int j_start = j * s_step_params->batch_size;
-            float* subG = workspace->d_G + i_start * s_step_params->samples_per_iter + j_start;
+            float* subG = workspace->d_G[workspace->compute_buf] + i_start * s_step_params->samples_per_iter + j_start;
             float* corr_j = workspace->d_correction + j_start;
             float* corr_curr = workspace->d_correction + i_start;
-            cublasSgemv(handle, CUBLAS_OP_T, s_step_params->batch_size, s_step_params->batch_size, &s_step_params->eta, subG, s_step_params->samples_per_iter, corr_j, 1, &beta, corr_curr, 1);
+            cublasSgemv(workspace->handle, CUBLAS_OP_T, s_step_params->batch_size, s_step_params->batch_size, &s_step_params->eta, subG, s_step_params->samples_per_iter, corr_j, 1, &beta, corr_curr, 1);
         }
         cuda_apply_sigmoid_block(workspace->d_correction, s_step_params->samples_per_iter, s_step_params->batch_size, i);
     }
@@ -315,7 +150,7 @@ void compute_sstep_gradient(
     
     // Compute final gradient = -A_scaled' * correction
     cublasSgemv(
-        handle,
+        workspace->handle,
         CUBLAS_OP_N,
         data_params->n_features,
         s_step_params->samples_per_iter,
@@ -330,12 +165,126 @@ void compute_sstep_gradient(
     );
 
     run_stats->grad_proj_time += grad_proj_timer.end();
-    /*
+}
+
+void launch_full_prefetch(
+    const DataParams* data_params,
+    const RunParams* s_step_params,
+    Workspace* workspace,
+    float* d_batch_A,
+    int target_buf)
+{
+    cudaEventRecord(workspace->gram_overhead_prefetch_done, workspace->prefetch_stream);
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cublasSgemm(
+        workspace->prefetch_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        s_step_params->samples_per_iter,
+        s_step_params->samples_per_iter,
+        data_params->n_features,
+        &alpha,
+        d_batch_A, data_params->n_features,
+        d_batch_A, data_params->n_features,
+        &beta,
+        workspace->d_G[target_buf], s_step_params->samples_per_iter);
+
+    cudaEventRecord(workspace->gram_prefetch_done, workspace->prefetch_stream);
+}
+
+void launch_uniform_prefetch(
+    const DataParams* data_params,
+    const RunParams* s_step_params,
+    Workspace* workspace,
+    float* d_batch_A,
+    int target_buf)
+{
     for (int i = 0; i < s_step_params->approx_gram_l; i++) {
-        cublasDestroy(handles[i]);
-        cudaStreamDestroy(streams[i]);
+        int src_col = rand() % data_params->n_features;
+        cublasScopy(workspace->prefetch_handle,
+            s_step_params->samples_per_iter,
+            d_batch_A + src_col,                       data_params->n_features,
+            workspace->d_batch_A_approx[target_buf] + i, s_step_params->approx_gram_l);
     }
-    */
+    // signal that this buffer is ready
+    cudaEventRecord(workspace->gram_overhead_prefetch_done, workspace->prefetch_stream);
+
+    // sgemm on same stream — won't start until all Scopy calls above finish
+    float alpha_approx = s_step_params->approx_gram_l / (float)data_params->n_features;
+    float beta = 0.0f;
+    cublasSgemm(
+        workspace->prefetch_handle,       // same handle = same stream
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        s_step_params->samples_per_iter,
+        s_step_params->samples_per_iter,
+        s_step_params->approx_gram_l,
+        &alpha_approx,
+        workspace->d_batch_A_approx[target_buf], s_step_params->approx_gram_l,
+        workspace->d_batch_A_approx[target_buf], s_step_params->approx_gram_l,
+        &beta,
+        workspace->d_G[target_buf], s_step_params->samples_per_iter);
+
+    // single event after gram is done
+    cudaEventRecord(workspace->gram_prefetch_done, workspace->prefetch_stream);
+}
+
+void launch_scoring_prefetch(
+    const DataParams* data_params,
+    const RunParams* s_step_params,
+    Workspace* workspace,
+    float* d_batch_A,
+    int target_buf,
+    int iters)
+{
+    iters = (iters + 1) % (data_params->total_samples / s_step_params->samples_per_iter);
+    if (!workspace->cache_valid[iters]) {
+        for (int i = 0; i < data_params->n_features; i++) {
+            cublasSdot(workspace->prefetch_handle,
+                s_step_params->samples_per_iter,
+                d_batch_A + i, data_params->n_features,
+                d_batch_A + i, data_params->n_features,
+                workspace->d_scores + i);   // device pointer — no sync per call
+        }
+    
+        cudaStreamSynchronize(workspace->prefetch_stream);
+        cudaMemcpy(workspace->score_cache[iters].data(), workspace->d_scores, data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
+    
+        // normalize on CPU
+        float sum = std::accumulate(workspace->score_cache[iters].begin(), workspace->score_cache[iters].end(), 0.0f);
+        for (auto& s : workspace->score_cache[iters])
+            s /= sum;
+        
+        workspace->cache_valid[iters] = true;
+    }
+    std::vector<int> sampled_cols = sample_columns_with_replacement(workspace->score_cache[iters], s_step_params->approx_gram_l);
+
+    
+    // now launch async on prefetch stream
+    for (int i = 0; i < s_step_params->approx_gram_l; i++) {
+        cublasScopy(workspace->prefetch_handle,
+            s_step_params->samples_per_iter,
+            d_batch_A + sampled_cols[i],          data_params->n_features,
+            workspace->d_batch_A_approx[target_buf] + i,  s_step_params->approx_gram_l);
+    }
+
+    cudaEventRecord(workspace->gram_overhead_prefetch_done, workspace->prefetch_stream);
+        
+    float alpha_approx = s_step_params->approx_gram_l / (float)data_params->n_features;
+    float beta = 0.0f;
+    cublasSgemm(
+        workspace->prefetch_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        s_step_params->samples_per_iter,
+        s_step_params->samples_per_iter,
+        s_step_params->approx_gram_l,
+        &alpha_approx,
+        workspace->d_batch_A_approx[target_buf], s_step_params->approx_gram_l,
+        workspace->d_batch_A_approx[target_buf], s_step_params->approx_gram_l,
+        &beta,
+        workspace->d_G[target_buf], s_step_params->samples_per_iter);
+
+    cudaEventRecord(workspace->gram_prefetch_done, workspace->prefetch_stream);
 }
 
 // ---------------- Train Function ----------------
@@ -364,25 +313,66 @@ void train(
 
     run_stats->scaling_time += scaling_timer.end();
 
-    for (int iters = 0; iters <= s_step_params->maxiters; iters++) {
+    if (s_step_params->approx_gram && s_step_params->approx_gram_type == "uniform")
+        launch_uniform_prefetch(data_params, s_step_params, workspace, workspace->d_A_scaled, workspace->prefetch_buf);
+    else if (s_step_params->approx_gram && s_step_params->approx_gram_type == "scoring")
+        launch_scoring_prefetch(data_params, s_step_params, workspace, workspace->d_A_scaled, workspace->prefetch_buf, 0);
+    else
+        launch_full_prefetch(data_params, s_step_params, workspace, workspace->d_A_scaled, workspace->prefetch_buf);
+
+    for (int iters = 0; iters < s_step_params->maxiters; iters++) {
         // determine current batch start offset (wrap around if we exceed total samples)
         int curr_batch_start_offset = ((iters * s_step_params->batch_size * s_step_params->s) % data_params->total_samples);
         float* d_batch_A = workspace->d_A_scaled + curr_batch_start_offset * data_params->n_features;
 
-        cudaMemset(workspace->d_grad, 0, data_params->n_features * sizeof(float));
-        
         CudaRegionTimer iter_timer;
         iter_timer.begin();
+
+        // wait for current iter prefetch to finish 
+        CudaRegionTimer gram_overhead_timer;
+        gram_overhead_timer.begin();
         
-        compute_sstep_gradient(data_params, s_step_params, workspace, d_batch_A, run_stats);
+        // cudaStreamWaitEvent(0, workspace->gram_overhead_prefetch_done, 0);
+        cudaEventSynchronize(workspace->gram_overhead_prefetch_done);
+        
+        run_stats->gram_overhead_time += gram_overhead_timer.end();
+        
+        CudaRegionTimer gram_compute_timer;
+        gram_compute_timer.begin();
+
+        // cudaStreamWaitEvent(0, workspace->gram_prefetch_done, 0);
+        cudaEventSynchronize(workspace->gram_prefetch_done);
+
+        run_stats->gram_compute_time += gram_compute_timer.end();
+
+        // launch next iteration's prefetch
+        // compute reads from prefetch_buf, prefetch writes into the other one
+        workspace->compute_buf  =  workspace->prefetch_buf;
+        int next_buf            = (workspace->prefetch_buf + 1) % 2;
+
+        // next batch pointer for prefetch
+        int next_offset = ((iters + 1) * s_step_params->samples_per_iter) % data_params->total_samples;
+        float* d_next_batch_A = workspace->d_A_scaled + next_offset * data_params->n_features;
+
+        if (s_step_params->approx_gram && s_step_params->approx_gram_type == "uniform")
+            launch_uniform_prefetch(data_params, s_step_params, workspace, d_next_batch_A, next_buf);
+        else if (s_step_params->approx_gram && s_step_params->approx_gram_type == "scoring")
+            launch_scoring_prefetch(data_params, s_step_params, workspace, d_next_batch_A, next_buf, iters + 1);
+        else
+            launch_full_prefetch(data_params, s_step_params, workspace, d_next_batch_A, next_buf);
+        
+        enter_recurrence(data_params, s_step_params, workspace, d_batch_A, run_stats);
 
         CudaRegionTimer weight_update_timer;
         weight_update_timer.begin();
-
+        
         // update weights: x = x - lr * grad
         cublasSaxpy(workspace->handle, data_params->n_features, &negEta, workspace->d_grad, 1, workspace->d_x, 1);
         
         run_stats->weight_update_time += weight_update_timer.end();
+
+        // alternate buffers for next iteration
+        workspace->prefetch_buf = next_buf;
 
         if (iters % s_step_params->printerval == 0) {
             // copy weights and compute metrics
@@ -393,9 +383,6 @@ void train(
             prev_obj = cur_obj;
         }
     }
-
-    // Copy back weights into h_x for comparison
-    cudaMemcpy(h_x.data(), workspace->d_x, data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
 // ---------------- Main ----------------
@@ -407,14 +394,16 @@ int main(
     std::unique_ptr<DataParams> data_params = std::make_unique<DataParams>();
     
     // Command-line arguments:
-    // [batch_size] [s] [training set file name]
+    // [batch_size] [s] [epochs] [training set file name] [approx type] [l]
     if (argc > 1) {
         if (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
-            std::cout << "Usage: " << argv[0] << " [batch_size] [s] [training set file name]\n";
+            std::cout << "Usage: " << argv[0] << " [batch_size] [s] [epochs] [training set file name] [approx type] [l]\n";
             std::cout << "  batch_size   : number of samples per minibatch (default 16)\n";
             std::cout << "  s            : number of minibatches to process before updating weights (default 4)\n";
             std::cout << "  epochs       : number of passes over dataset to process (default 1)\n";
             std::cout << "  training set : file name of training dataset (default 'w1a.txt')\n";
+            std::cout << "  approx type  : type of approximate Gram matrix ('uniform' or 'scoring')\n";
+            std::cout << "  l            : number of columns to sample for approximate Gram matrix (default 64)\n";
             return 0;
         }
         s_step_params->batch_size = std::max(1, std::atoi(argv[1]));
@@ -429,7 +418,7 @@ int main(
         data_params->file_name = argv[4];
     }
     if (argc > 5) {
-	s_step_params->approx_gram = true;
+        s_step_params->approx_gram = true;
         s_step_params->approx_gram_type = argv[5];
     }
     if (argc > 6) {
@@ -460,15 +449,14 @@ int main(
         return 1;
     }
 
-
-    // calculate number of iterations based on epochs and padded total samples
+    // calculate number of iterations(total_samples / s * batch_size) based on epochs and padded total samples
     s_step_params->maxiters = s_step_params->epochs * data_params->total_samples / s_step_params->samples_per_iter;
     s_step_params->printerval = data_params->total_samples / s_step_params->samples_per_iter;
     
     std::unique_ptr<Workspace> workspace = std::make_unique<Workspace>(data_params.get(), s_step_params.get());
     std::unique_ptr<ProfileStats> run_stats = std::make_unique<ProfileStats>();
     
-    // Allocate and copy data to GPU
+    // copy data to GPU
     cudaMemcpy(workspace->d_A, h_A.data(), data_params->total_samples * data_params->n_features * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(workspace->d_y, h_y.data(), data_params->total_samples * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemset(workspace->d_x, 0, data_params->n_features * sizeof(float));
