@@ -138,7 +138,7 @@ void enter_recurrence(
             float* corr_curr = workspace->d_correction + i_start;
             cublasSgemv(workspace->handle, CUBLAS_OP_T, s_step_params->batch_size, s_step_params->batch_size, &s_step_params->eta, subG, s_step_params->samples_per_iter, corr_j, 1, &beta, corr_curr, 1);
         }
-        cuda_apply_sigmoid_block(workspace->d_correction, s_step_params->samples_per_iter, s_step_params->batch_size, i);
+        cuda_apply_sigmoid_block(workspace->compute_stream, workspace->d_correction, s_step_params->samples_per_iter, s_step_params->batch_size, i);
     }
   
     run_stats->recurrence_time += recurrence_timer.end();
@@ -332,16 +332,16 @@ void train(
         CudaRegionTimer gram_overhead_timer;
         gram_overhead_timer.begin();
         
-        // cudaStreamWaitEvent(0, workspace->gram_overhead_prefetch_done, 0);
-        cudaEventSynchronize(workspace->gram_overhead_prefetch_done);
+        cudaStreamWaitEvent(workspace->compute_stream, workspace->gram_overhead_prefetch_done, 0);
+        // cudaEventSynchronize(workspace->gram_overhead_prefetch_done);
         
         run_stats->gram_overhead_time += gram_overhead_timer.end();
         
         CudaRegionTimer gram_compute_timer;
         gram_compute_timer.begin();
 
-        // cudaStreamWaitEvent(0, workspace->gram_prefetch_done, 0);
-        cudaEventSynchronize(workspace->gram_prefetch_done);
+        cudaStreamWaitEvent(workspace->compute_stream, workspace->gram_prefetch_done, 0);
+        // cudaEventSynchronize(workspace->gram_prefetch_done);
 
         run_stats->gram_compute_time += gram_compute_timer.end();
 

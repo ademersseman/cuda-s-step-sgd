@@ -19,9 +19,9 @@ __global__ void apply_sigmoid_kernel(float *correction, int total_samples, int b
     }
 }
 // ================== CUDA Helper Functions (callable from host) ==================
-void cuda_apply_sigmoid_block(float *correction, int total_samples, int batch_size, int block_idx)
+void cuda_apply_sigmoid_block(cudaStream_t stream, float *correction, int total_samples, int batch_size, int block_idx)
 {
     int blocks_sigmoid = (batch_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    apply_sigmoid_kernel<<<blocks_sigmoid, BLOCK_SIZE>>>(correction, total_samples, batch_size, block_idx);
+    apply_sigmoid_kernel<<<blocks_sigmoid, BLOCK_SIZE, 0, stream>>>(correction, total_samples, batch_size, block_idx);
     cudaDeviceSynchronize();
 }

@@ -49,7 +49,7 @@ struct CudaRegionTimer {
 
     float end(cudaStream_t stream = 0) {
         cudaEventRecord(stop, stream);
-        cudaEventSynchronize(stop);
+        // cudaEventSynchronize(stop);
         float ms;
         cudaEventElapsedTime(&ms, start, stop);
         return ms;
@@ -79,6 +79,7 @@ struct Workspace {
     cublasHandle_t handle;
     cublasHandle_t prefetch_handle;   // handle bound to prefetch stream
     cudaStream_t   prefetch_stream;
+    cudaStream_t   compute_stream;
     cudaEvent_t    gram_overhead_prefetch_done;     // signals when buffer is ready
     cudaEvent_t    gram_prefetch_done;     // signals when buffer is ready
     int            prefetch_buf = 0;  // which buffer the prefetch wrote into
@@ -103,9 +104,11 @@ struct Workspace {
         cache_valid = std::vector<bool>(data_params->total_samples / s_step_params->samples_per_iter, false);
 
         cublasCreate(&handle);
-        cudaStreamCreate(&prefetch_stream);
         cublasCreate(&prefetch_handle);
+        cudaStreamCreateWithFlags(&prefetch_stream, cudaStreamNonBlocking);
+        cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking);
         cublasSetStream(prefetch_handle, prefetch_stream);
+        cublasSetStream(handle, compute_stream);
         cudaEventCreateWithFlags(&gram_overhead_prefetch_done, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&gram_prefetch_done, cudaEventDisableTiming);
     }
@@ -128,15 +131,34 @@ struct Workspace {
         cublasDestroy(handle);
         cublasDestroy(prefetch_handle);
         cudaStreamDestroy(prefetch_stream);
+        cudaStreamDestroy(compute_stream);
         cudaEventDestroy(gram_prefetch_done);
         cudaEventDestroy(gram_overhead_prefetch_done);
     }
 };
 
 // CUDA wrapper functions callable from host
-void compute_sstep_gradient(const DataParams *data_params, const RunParams *s_step_params, Workspace *workspace, float* A, ProfileStats* stats);
-void cuda_apply_sigmoid_block(float *correction, int total_samples, int batch_size, int block_idx);
-void cuda_compute_gram_uniform_approx(float *d_A_scaled, int *d_sampled_cols, float *d_G, int samples_per_iter, int n_features, int l);
+void compute_sstep_gradient(
+    const DataParams *data_params, 
+    const RunParams *s_step_params, 
+    Workspace *workspace, 
+    float* A, 
+    ProfileStats* stats);
+
+void cuda_apply_sigmoid_block(
+    cudaStream_t stream, 
+    float *correction, 
+    int total_samples, 
+    int batch_size, int 
+    block_idx);
+
+void cuda_compute_gram_uniform_approx(
+    float *d_A_scaled, 
+    int *d_sampled_cols, 
+    float *d_G, 
+    int samples_per_iter, 
+    int n_features, 
+    int l);
 
 void train(
     const DataParams* data_params,
