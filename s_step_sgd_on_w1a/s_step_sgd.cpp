@@ -14,6 +14,7 @@
 #include <numeric>
 #include <cstdlib>
 #include <ctime>
+#include <iomanip>
 
 // ---------------- Load LIBSVM file ----------------
 void load_libsvm(
@@ -96,7 +97,7 @@ std::vector<int> sample_columns_with_replacement(
         float rand_val = (float)rand() / RAND_MAX;
         for (size_t j = 0; j < cumsum.size(); j++) {
             if (rand_val <= cumsum[j]) {
-                sampled.push_back(j);
+                sampled.push_back(j);       
                 break;
             }
         }
@@ -237,7 +238,7 @@ void launch_scoring_prefetch(
     int target_buf,
     int iters)
 {
-    iters = (iters + 1) % (data_params->total_samples / s_step_params->samples_per_iter);
+    iters = iters % (data_params->total_samples / s_step_params->samples_per_iter);
     if (!workspace->cache_valid[iters]) {
         for (int i = 0; i < data_params->n_features; i++) {
             cublasSdot(workspace->prefetch_handle,
@@ -246,7 +247,7 @@ void launch_scoring_prefetch(
                 d_batch_A + i, data_params->n_features,
                 workspace->d_scores + i);   // device pointer — no sync per call
         }
-    
+   
         cudaStreamSynchronize(workspace->prefetch_stream);
         cudaMemcpy(workspace->score_cache[iters].data(), workspace->d_scores, data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
     
@@ -320,7 +321,7 @@ void train(
     else
         launch_full_prefetch(data_params, s_step_params, workspace, workspace->d_A_scaled, workspace->prefetch_buf);
 
-    for (int iters = 0; iters < s_step_params->maxiters; iters++) {
+    for (int iters = 0; iters <= s_step_params->maxiters; iters++) {
         // determine current batch start offset (wrap around if we exceed total samples)
         int curr_batch_start_offset = ((iters * s_step_params->batch_size * s_step_params->s) % data_params->total_samples);
         float* d_batch_A = workspace->d_A_scaled + curr_batch_start_offset * data_params->n_features;
@@ -333,7 +334,7 @@ void train(
         gram_overhead_timer.begin();
         
         cudaStreamWaitEvent(workspace->compute_stream, workspace->gram_overhead_prefetch_done, 0);
-        // cudaEventSynchronize(workspace->gram_overhead_prefetch_done);
+        //cudaEventSynchronize(workspace->gram_overhead_prefetch_done);
         
         run_stats->gram_overhead_time += gram_overhead_timer.end();
         
@@ -374,7 +375,7 @@ void train(
         // alternate buffers for next iteration
         workspace->prefetch_buf = next_buf;
 
-        if (iters % s_step_params->printerval == 0) {
+        if (iters != 0 && iters % s_step_params->printerval == 0) {
             // copy weights and compute metrics
             cudaMemcpy(h_x.data(), workspace->d_x, data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
             compute_metrics(data_params, h_A, h_y, h_x, cur_obj, cur_acc);

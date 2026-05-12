@@ -18,14 +18,14 @@ struct ProfileStats {
 struct RunParams {
     int batch_size = 16;
     int s = 4;
-    int samples_per_iter = batch_size * s;
+    int samples_per_iter = 0;
     int epochs = 10;
     int maxiters = 65536;
-    float eta = 0.5f;
-    int printerval = 512;
+    float eta = 0.01f;
+    int printerval = 1;
     bool approx_gram = false;
-    int approx_gram_l = 64; // number of columns to sample for approximate Gram matrix (if enabled)
-    std::string approx_gram_type = "uniform"; // method for sampling features for approximate Gram matrix ("uniform" or "leverage")
+    int approx_gram_l = 0; // number of columns to sample for approximate Gram matrix (if enabled)
+    std::string approx_gram_type = "Full"; // method for sampling features for approximate Gram matrix ("uniform" or "leverage")
 };
 
 struct DataParams {
