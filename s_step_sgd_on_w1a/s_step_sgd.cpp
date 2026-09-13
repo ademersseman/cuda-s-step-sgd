@@ -177,7 +177,7 @@ void train(
         gram_overhead_timer.begin();
         
         cudaStreamWaitEvent(workspace->compute_stream, workspace->gram_overhead_prefetch_done, 0);
-        // cudaEventSynchronize(workspace->gram_overhead_prefetch_done);
+        //cudaEventSynchronize(workspace->gram_overhead_prefetch_done);
         
         run_stats->gram_overhead_time += gram_overhead_timer.end();
         
@@ -213,7 +213,7 @@ void train(
         // alternate buffers for next iteration
         workspace->prefetch_buf = next_buf;
 
-        if (iters % s_step_params->printerval == 0) {
+        if (iters != 0 && iters % s_step_params->printerval == 0) {
             // copy weights and compute metrics
             cudaMemcpy(h_x.data(), workspace->d_x, data_params->n_features * sizeof(float), cudaMemcpyDeviceToHost);
             compute_metrics(data_params, h_A, h_y, h_x, cur_obj, cur_acc);
