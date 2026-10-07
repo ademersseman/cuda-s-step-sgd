@@ -1,0 +1,16 @@
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape,
+  -bugprone-narrowing-conversions,
+  -performance-enum-size,
+  -portability-avoid-pragma-once
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(^|/)(feature_sampling|libsvm_loader|prefetch|s_step_sgd)\.hpp$'
+FormatStyle: file
+CheckOptions:
+  bugprone-assert-side-effect.AssertMacros: 'assert'
