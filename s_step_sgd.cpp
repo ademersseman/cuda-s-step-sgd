@@ -40,6 +40,86 @@ void compute_metrics(const DataParams* data_params, Workspace* workspace, double
                static_cast<double>(data_params->sample_count);
 }
 
+void launch_cublas_recurrence(const RunParams* run_params, Workspace* workspace,
+                              size_t active_sampled_feature_count) {
+    const int batch_size = run_params->batch_size;
+    const int sampled_feature_count = static_cast<int>(active_sampled_feature_count);
+    const long long sampled_batch_stride =
+        static_cast<long long>(batch_size) * sampled_feature_count;
+    const float one{1.0f};
+    const float zero{0.0f};
+
+    cuda_sigmoid(workspace->compute_stream, workspace->device_block_margins_or_residuals,
+                 workspace->device_base_residuals, run_params->samples_per_iteration);
+    check_cublas(cublasSgemmStridedBatched(
+        workspace->cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, sampled_feature_count, 1, batch_size,
+        &one, workspace->sampled_batch_slots[workspace->current_slot_index].device_sampled_features,
+        sampled_feature_count, sampled_batch_stride, workspace->device_base_residuals, batch_size,
+        batch_size, &zero, workspace->device_projected_gradient_prefix, sampled_feature_count,
+        sampled_feature_count, run_params->s));
+    cuda_exclusive_prefix_columns(workspace->compute_stream,
+                                  workspace->device_projected_gradient_prefix,
+                                  active_sampled_feature_count, run_params->s);
+    const float learning_rate_per_sample =
+        run_params->learning_rate / static_cast<float>(batch_size);
+    check_cublas(cublasSgemmStridedBatched(
+        workspace->cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, batch_size, 1, sampled_feature_count,
+        &learning_rate_per_sample,
+        workspace->sampled_batch_slots[workspace->current_slot_index].device_sampled_features,
+        sampled_feature_count, sampled_batch_stride, workspace->device_projected_gradient_prefix,
+        sampled_feature_count, sampled_feature_count, &one,
+        workspace->device_block_margins_or_residuals, batch_size, batch_size, run_params->s));
+    cuda_corrected_sigmoid_and_accumulate(
+        workspace->compute_stream, workspace->device_block_margins_or_residuals,
+        workspace->device_base_residuals, workspace->device_block_margins_or_residuals,
+        run_params->samples_per_iteration, workspace->device_recurrence_stats);
+}
+
+cudaGraphExec_t recurrence_graph_for(const Workspace* workspace, size_t slot_index,
+                                     size_t sampled_feature_count) {
+    const auto graph =
+        std::find_if(workspace->recurrence_graphs.begin(), workspace->recurrence_graphs.end(),
+                     [slot_index, sampled_feature_count](const RecurrenceGraph& candidate) {
+                         return candidate.slot_index == slot_index &&
+                                candidate.sampled_feature_count == sampled_feature_count;
+                     });
+    if (graph == workspace->recurrence_graphs.end())
+        throw std::runtime_error("missing recurrence CUDA graph");
+    return graph->executable;
+}
+
+void prepare_recurrence_graphs(const RunParams* run_params, Workspace* workspace) {
+    std::vector<size_t> sampled_feature_counts;
+    for (const size_t candidate : {size_t{8}, size_t{16}, size_t{32}, size_t{64}}) {
+        const size_t sampled_feature_count = std::min(candidate, workspace->leverage_sketch.size());
+        if (std::find(sampled_feature_counts.begin(), sampled_feature_counts.end(),
+                      sampled_feature_count) == sampled_feature_counts.end())
+            sampled_feature_counts.push_back(sampled_feature_count);
+    }
+
+    const size_t original_slot_index = workspace->current_slot_index;
+    for (const size_t sampled_feature_count : sampled_feature_counts) {
+        // Initialize cuBLAS's kernels for this shape before stream capture.
+        workspace->current_slot_index = 0;
+        launch_cublas_recurrence(run_params, workspace, sampled_feature_count);
+        check_cuda(cudaStreamSynchronize(workspace->compute_stream));
+
+        for (size_t slot_index = 0; slot_index < workspace->sampled_batch_slots.size();
+             ++slot_index) {
+            workspace->current_slot_index = slot_index;
+            RecurrenceGraph recurrence_graph{slot_index, sampled_feature_count};
+            check_cuda(cudaStreamBeginCapture(workspace->compute_stream,
+                                              cudaStreamCaptureModeThreadLocal));
+            launch_cublas_recurrence(run_params, workspace, sampled_feature_count);
+            check_cuda(cudaStreamEndCapture(workspace->compute_stream, &recurrence_graph.graph));
+            check_cuda(
+                cudaGraphInstantiate(&recurrence_graph.executable, recurrence_graph.graph, 0));
+            workspace->recurrence_graphs.push_back(recurrence_graph);
+        }
+    }
+    workspace->current_slot_index = original_slot_index;
+}
+
 void enter_recurrence(const DataParams* data_params, const RunParams* run_params,
                       Workspace* workspace, float* device_signed_batch,
                       size_t active_sampled_feature_count) {
@@ -52,65 +132,9 @@ void enter_recurrence(const DataParams* data_params, const RunParams* run_params
                              data_params->feature_count, workspace->device_weights, 1, &beta,
                              workspace->device_block_margins_or_residuals, 1));
 
-    const int batch_size = run_params->batch_size;
-    const int sampled_feature_count = static_cast<int>(active_sampled_feature_count);
-    const int minibatch_count = run_params->s;
-    const long long sampled_batch_stride =
-        static_cast<long long>(batch_size) * sampled_feature_count;
-    const float one{1.0f};
-    const float zero{0.0f};
-
-    // Every source residual is evaluated at the same base model.
-    cuda_sigmoid(workspace->compute_stream, workspace->device_block_margins_or_residuals,
-                 workspace->device_base_residuals, run_params->samples_per_iteration);
-
-    // U_j = B_j^T r_j for all minibatches. B is the weighted sampled matrix.
-    check_cublas(cublasSgemmStridedBatched(
-        workspace->cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, sampled_feature_count, 1, batch_size,
-        &one, workspace->sampled_batch_slots[workspace->current_slot_index].device_sampled_features,
-        sampled_feature_count, sampled_batch_stride, workspace->device_base_residuals, batch_size,
-        batch_size, &zero, workspace->device_projected_gradient_prefix, sampled_feature_count,
-        sampled_feature_count, minibatch_count));
-
-    // Replace U_i by sum_{j<i} U_j, one independent scan per sampled feature.
-    cuda_exclusive_prefix_columns(workspace->compute_stream,
-                                  workspace->device_projected_gradient_prefix,
-                                  active_sampled_feature_count, run_params->s);
-
-    const float learning_rate_per_sample =
-        run_params->learning_rate / static_cast<float>(batch_size);
-    // Add learning_rate * B_i * sum_{j<i}(B_j^T r_j) to each minibatch's base margins.
-    check_cublas(cublasSgemmStridedBatched(
-        workspace->cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, batch_size, 1, sampled_feature_count,
-        &learning_rate_per_sample,
-        workspace->sampled_batch_slots[workspace->current_slot_index].device_sampled_features,
-        sampled_feature_count, sampled_batch_stride, workspace->device_projected_gradient_prefix,
-        sampled_feature_count, sampled_feature_count, &one,
-        workspace->device_block_margins_or_residuals, batch_size, batch_size, minibatch_count));
-    // Convert corrected margins to residuals while measuring the recurrence's relative effect.
-    cuda_corrected_sigmoid_and_accumulate(
-        workspace->compute_stream, workspace->device_block_margins_or_residuals,
-        workspace->device_base_residuals, workspace->device_block_margins_or_residuals,
-        run_params->samples_per_iteration, workspace->device_recurrence_stats);
-}
-
-void warm_recurrence_shapes(const DataParams* data_params, const RunParams* run_params,
-                            Workspace* workspace) {
-    size_t sampled_feature_count = std::min<size_t>(8, workspace->leverage_sketch.size());
-    while (true) {
-        prefetch_leverage_features(data_params, run_params, workspace,
-                                   workspace->device_signed_features, workspace->current_slot_index,
-                                   0, sampled_feature_count);
-        auto& slot = workspace->sampled_batch_slots[workspace->current_slot_index];
-        check_cuda(cudaStreamWaitEvent(workspace->compute_stream, slot.prefetch_done, 0));
-        enter_recurrence(data_params, run_params, workspace, workspace->device_signed_features,
-                         sampled_feature_count);
-        check_cuda(cudaStreamSynchronize(workspace->compute_stream));
-        if (sampled_feature_count == workspace->leverage_sketch.size())
-            break;
-        sampled_feature_count =
-            std::min(sampled_feature_count * 2, workspace->leverage_sketch.size());
-    }
+    check_cuda(cudaGraphLaunch(recurrence_graph_for(workspace, workspace->current_slot_index,
+                                                    active_sampled_feature_count),
+                               workspace->compute_stream));
 }
 
 // ---------------- Train Function ----------------
@@ -131,8 +155,8 @@ void train(const DataParams* data_params, const RunParams* run_params, Workspace
     // feature prefetch reads device_signed_features.
     check_cuda(cudaStreamSynchronize(workspace->compute_stream));
 
-    // Initialize each cuBLAS recurrence shape before measuring the training loop.
-    warm_recurrence_shapes(data_params, run_params, workspace);
+    // Capture one cuBLAS recurrence graph for each buffer slot and adaptive sampled width.
+    prepare_recurrence_graphs(run_params, workspace);
 
     // Gather the first block using its independently sampled leverage columns.
     if (run_params->iteration_count > 0)
@@ -145,6 +169,8 @@ void train(const DataParams* data_params, const RunParams* run_params, Workspace
     std::uniform_real_distribution<float> uniform_distribution(0.0f, 1.0f);
     float smoothed_correction_ratio = 0.0f;
     bool has_smoothed_correction_ratio = false;
+    bool has_pending_recurrence_stats = false;
+    size_t pending_stats_block_index = 0;
     size_t sampled_feature_count_sum = 0;
 
     for (int iteration_index{0}; iteration_index < run_params->iteration_count; ++iteration_index) {
@@ -201,23 +227,34 @@ void train(const DataParams* data_params, const RunParams* run_params, Workspace
                                  workspace->device_block_margins_or_residuals, 1, &one,
                                  workspace->device_weights, 1));
 
-        check_cuda(cudaMemcpyAsync(workspace->host_recurrence_stats,
-                                   workspace->device_recurrence_stats, sizeof(RecurrenceStats),
-                                   cudaMemcpyDeviceToHost, workspace->compute_stream));
-        check_cuda(cudaStreamSynchronize(workspace->compute_stream));
-        const auto& recurrence_stats = *workspace->host_recurrence_stats;
-        const float correction_ratio =
-            std::sqrt(recurrence_stats.corrected_residual_difference_squared_sum /
-                      std::max(recurrence_stats.base_residual_squared_sum, 1e-20f));
-        smoothed_correction_ratio = has_smoothed_correction_ratio
-                                        ? 0.9f * smoothed_correction_ratio + 0.1f * correction_ratio
-                                        : correction_ratio;
-        has_smoothed_correction_ratio = true;
-        if (block_index + 2 < workspace->leverage_sketch.sketch_count) {
-            workspace->leverage_sketch.sampled_feature_counts[block_index + 2] =
+        // Consume the previous block's statistics while this block remains queued on the GPU.
+        if (has_pending_recurrence_stats) {
+            check_cuda(cudaEventSynchronize(workspace->recurrence_stats_copy_done));
+            const auto& recurrence_stats = *workspace->host_recurrence_stats;
+            const float correction_ratio =
+                std::sqrt(recurrence_stats.corrected_residual_difference_squared_sum /
+                          std::max(recurrence_stats.base_residual_squared_sum, 1e-20f));
+            smoothed_correction_ratio =
+                has_smoothed_correction_ratio
+                    ? 0.9f * smoothed_correction_ratio + 0.1f * correction_ratio
+                    : correction_ratio;
+            has_smoothed_correction_ratio = true;
+            workspace->leverage_sketch.sampled_feature_counts[pending_stats_block_index + 3] =
                 stochastic_sampled_feature_count(smoothed_correction_ratio,
                                                  uniform_distribution(controller_random_generator),
                                                  workspace->leverage_sketch.size());
+            has_pending_recurrence_stats = false;
+        }
+
+        // Copy this block's statistics only when they can control a future prefetched block.
+        if (block_index + 3 < workspace->leverage_sketch.sketch_count) {
+            check_cuda(cudaMemcpyAsync(workspace->host_recurrence_stats,
+                                       workspace->device_recurrence_stats, sizeof(RecurrenceStats),
+                                       cudaMemcpyDeviceToHost, workspace->compute_stream));
+            check_cuda(
+                cudaEventRecord(workspace->recurrence_stats_copy_done, workspace->compute_stream));
+            pending_stats_block_index = block_index;
+            has_pending_recurrence_stats = true;
         }
 
         // alternate buffers for next iteration

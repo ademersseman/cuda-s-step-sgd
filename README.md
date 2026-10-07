@@ -5,14 +5,14 @@ Build with CMake:
 ```bash
 module load cudatoolkit
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j 4
+cmake --build build -j
 ```
 
 ## Factored leverage approximation
 
 The executable estimates rank-32 column leverage probabilities from 512
 training rows, independently samples columns for every s-step block, and
-weights column `j` by `1/sqrt(l*p[j])`:
+weights sampled column `j` by `1/sqrt(l*p[j])`:
 
 ```bash
 ./build/s_step_sgd --batch-size 256 --s 352 --n-iters 100 \

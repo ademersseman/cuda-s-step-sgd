@@ -92,3 +92,62 @@ fixed baseline's held-out accuracy at `s=32` and `s=128` and gains two correct
 predictions out of 16,384 at `s=384`. Full trial ranges, losses, wall times,
 hashes, and raw artifacts are in
 `results/stochastic_controller_20261007/BENCHMARK.md`.
+
+## Unweighted leverage samples
+
+Slurm job `59498139` compared the stochastic controller's original
+`1/sqrt(l*p[j])` column weighting with `1/sqrt(l)` weighting on the same
+A100-SXM4-80GB, dataset, and training parameters. Medians are from three
+alternating trials.
+
+| s | Weighted runtime | Unweighted runtime | Reduction | Weighted accuracy | Unweighted accuracy |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 52.769 ms | 52.509 ms | 0.49% | 74.865723% | 74.853516% |
+| 128 | 198.807 ms | 196.541 ms | 1.14% | 76.257324% | 76.251221% |
+| 384 | 574.592 ms | 566.145 ms | 1.47% | 77.142334% | 77.136230% |
+
+The unweighted controller stayed at `l=8`, whereas the weighted controller
+used average widths of 12.267, 16.600, and 19.733. Removing the probability
+correction makes the Gram estimator biased and drastically reduces its
+magnitude, so the runtime reduction is primarily a consequence of suppressing
+the recurrence correction. Full trial ranges, losses, hashes, and raw
+artifacts are in `results/unweighted_leverage_20261007/BENCHMARK.md`.
+
+## Delayed controller statistics
+
+Slurm job `59501784` compared the immediate synchronized `l[i+2]` controller
+with an event-pipelined `l[i+3]` controller on the same A100-SXM4-80GB,
+dataset, and training parameters. Both binaries came from the same source
+snapshot and neither prewarmed recurrence shapes.
+
+| s | Immediate runtime | Delayed runtime | Delayed change | Immediate accuracy | Delayed accuracy |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 61.652 ms | 61.025 ms | 1.02% faster | 74.865723% | 74.865723% |
+| 128 | 206.232 ms | 206.305 ms | 0.04% slower | 76.257324% | 76.251221% |
+| 384 | 579.971 ms | 577.149 ms | 0.49% faster | 77.142334% | 77.130127% |
+
+The delayed controller removes the per-block compute-stream synchronization.
+Its average sampled widths were 12.067, 16.467, and 19.667, compared with
+12.267, 16.600, and 19.733 for the immediate controller. Full trial ranges,
+losses, hashes, and raw artifacts are in
+`results/delayed_controller_20261007/BENCHMARK.md`.
+
+## Fused recurrence CUDA graphs
+
+Slurm job `59503156` compared the delayed-controller cuBLAS recurrence with a
+hybrid implementation on the same A100-SXM4-80GB, dataset, and training
+parameters. The hybrid uses fused recurrence CUDA graphs through `s=128` and
+retains cuBLAS for larger `s`. Medians are from three alternating trials.
+
+| s | cuBLAS control | Hybrid fused graph | Reduction | Control accuracy | Hybrid accuracy |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 60.836 ms | 56.710 ms | 6.78% | 74.865723% | 74.865723% |
+| 128 | 206.909 ms | 204.628 ms | 1.10% | 76.251221% | 76.251221% |
+| 384 | 577.251 ms | 577.089 ms | 0.03% | 77.130127% | 77.130127% |
+
+The fused path combines projected-gradient formation with the exclusive prefix,
+and combines recurrence application with the corrected sigmoid and statistics
+reduction. CUDA graphs are cached by double-buffer slot and sampled width.
+Held-out losses, controller widths, and correction ratios match the control.
+Full trial ranges, hashes, and raw artifacts are in
+`results/fused_graph_20261007/BENCHMARK.md`.

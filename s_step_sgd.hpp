@@ -167,6 +167,13 @@ struct SampledBatchSlot {
     cudaEvent_t compute_done{nullptr};
 };
 
+struct RecurrenceGraph {
+    size_t slot_index{0};
+    size_t sampled_feature_count{0};
+    cudaGraph_t graph{nullptr};
+    cudaGraphExec_t executable{nullptr};
+};
+
 struct Workspace {
     float* device_features{nullptr};
     float* device_labels{nullptr};
@@ -183,8 +190,10 @@ struct Workspace {
 
     cudaStream_t prefetch_stream{nullptr};
     cudaStream_t compute_stream{nullptr};
+    cudaEvent_t recurrence_stats_copy_done{nullptr};
     cublasHandle_t cublas_handle{nullptr};
     std::array<SampledBatchSlot, 2> sampled_batch_slots{};
+    std::vector<RecurrenceGraph> recurrence_graphs{};
     size_t current_slot_index{0};
 
     Workspace(const DataParams* data_params, const RunParams* run_params,
@@ -195,8 +204,8 @@ struct Workspace {
           device_metric_margins(nullptr), device_metric_sums(nullptr),
           device_recurrence_stats(nullptr), host_recurrence_stats(nullptr),
           leverage_sketch(std::move(initial_leverage_sketch)), prefetch_stream(nullptr),
-          compute_stream(nullptr), cublas_handle(nullptr), sampled_batch_slots{},
-          current_slot_index(0) {
+          compute_stream(nullptr), recurrence_stats_copy_done(nullptr), cublas_handle(nullptr),
+          sampled_batch_slots{}, recurrence_graphs{}, current_slot_index(0) {
         const size_t dataset_element_count =
             data_params->padded_sample_count * data_params->feature_count;
         const size_t sampled_element_count =
@@ -204,6 +213,8 @@ struct Workspace {
         try {
             check_cuda(cudaStreamCreateWithFlags(&prefetch_stream, cudaStreamNonBlocking));
             check_cuda(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
+            check_cuda(
+                cudaEventCreateWithFlags(&recurrence_stats_copy_done, cudaEventDisableTiming));
             check_cublas(cublasCreate(&cublas_handle));
             for (auto& batch_slot : sampled_batch_slots) {
                 check_cuda(
@@ -235,6 +246,10 @@ struct Workspace {
             check_cublas(cublasSetMathMode(cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH));
             check_cublas(cublasSetStream(cublas_handle, compute_stream));
         } catch (...) {
+            for (auto& recurrence_graph : recurrence_graphs) {
+                cudaGraphExecDestroy(recurrence_graph.executable);
+                cudaGraphDestroy(recurrence_graph.graph);
+            }
             cudaFree(device_features);
             cudaFree(device_labels);
             cudaFree(device_weights);
@@ -251,6 +266,7 @@ struct Workspace {
                 cudaEventDestroy(batch_slot.prefetch_done);
                 cudaEventDestroy(batch_slot.compute_done);
             }
+            cudaEventDestroy(recurrence_stats_copy_done);
             cublasDestroy(cublas_handle);
             cudaStreamDestroy(compute_stream);
             cudaStreamDestroy(prefetch_stream);
@@ -259,6 +275,10 @@ struct Workspace {
     }
 
     ~Workspace() {
+        for (auto& recurrence_graph : recurrence_graphs) {
+            cudaGraphExecDestroy(recurrence_graph.executable);
+            cudaGraphDestroy(recurrence_graph.graph);
+        }
         cudaFree(device_features);
         cudaFree(device_labels);
         cudaFree(device_weights);
@@ -275,6 +295,7 @@ struct Workspace {
             cudaEventDestroy(batch_slot.prefetch_done);
             cudaEventDestroy(batch_slot.compute_done);
         }
+        cudaEventDestroy(recurrence_stats_copy_done);
         cublasDestroy(cublas_handle);
         cudaStreamDestroy(compute_stream);
         cudaStreamDestroy(prefetch_stream);
