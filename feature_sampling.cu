@@ -4,12 +4,12 @@
 #include <climits>
 #include <cmath>
 #include <cusolverDn.h>
-#include <numeric>
-#include <random>
 #include <source_location>
 #include <stdexcept>
+#include <vector>
 
 namespace {
+// Throw a source-aware exception when a cuSOLVER call fails.
 void check_cusolver(cusolverStatus_t status,
                     const std::source_location& location = std::source_location::current()) {
     if (status != CUSOLVER_STATUS_SUCCESS) {
@@ -18,6 +18,7 @@ void check_cusolver(cusolverStatus_t status,
     }
 }
 
+// Copy a cuSOLVER status value to the host and reject failed factorizations.
 void check_factorization_info(int* device_info) {
     int info = 0;
     check_cuda(cudaMemcpy(&info, device_info, sizeof(info), cudaMemcpyDeviceToHost));
@@ -25,6 +26,7 @@ void check_factorization_info(int* device_info) {
         throw std::runtime_error("GPU factorization failed with info=" + std::to_string(info));
 }
 
+// Convert a column-major matrix into an explicit orthonormal QR basis in place.
 void orthonormalize_columns(cusolverDnHandle_t solver_handle, float* matrix, int row_count,
                             int column_count, float* tau, float* solver_workspace,
                             int solver_workspace_size, int* device_info) {
@@ -37,93 +39,173 @@ void orthonormalize_columns(cusolverDnHandle_t solver_handle, float* matrix, int
     check_factorization_info(device_info);
 }
 
-__global__ void calculate_leverage_scores(const float* right_basis, float* scores,
-                                          int feature_count, int rank) {
+// Convert each right-basis row norm directly into a normalized sampling probability.
+__global__ void calculate_leverage_probabilities(const float* right_basis, float* probabilities,
+                                                 int feature_count, int rank,
+                                                 float uniform_mix) {
     const int feature = blockIdx.x * blockDim.x + threadIdx.x;
     if (feature >= feature_count)
         return;
     float score = 0.0f;
     for (int component = 0; component < rank; ++component) {
         const float value = right_basis[feature + component * feature_count];
-        score += value * value;
+        score = fmaf(value, value, score);
     }
-    scores[feature] = score;
+    const float uniform_probability = 1.0f / static_cast<float>(feature_count);
+    probabilities[feature] =
+        (1.0f - uniform_mix) * score / static_cast<float>(rank) +
+        uniform_mix * uniform_probability;
 }
 
-__global__ void normalize_leverage_scores(float* probabilities, int feature_count, float score_sum,
-                                          float uniform_mix) {
-    const int feature = blockIdx.x * blockDim.x + threadIdx.x;
-    if (feature >= feature_count)
+// Gather randomly selected dataset rows into a compact row-major device matrix.
+__global__ void gather_sampled_rows(const float* features, float* sampled_features,
+                                    const double* random_values, std::size_t sample_count,
+                                    std::size_t feature_count,
+                                    std::size_t sampled_row_count) {
+    for (std::size_t sampled_row = blockIdx.x; sampled_row < sampled_row_count;
+         sampled_row += gridDim.x) {
+        const std::size_t source_row =
+            sampled_row_count == sample_count
+                ? sampled_row
+                : min(static_cast<std::size_t>(random_values[sampled_row] * sample_count),
+                      sample_count - 1);
+        for (std::size_t feature = threadIdx.x; feature < feature_count;
+             feature += blockDim.x)
+            sampled_features[sampled_row * feature_count + feature] =
+                features[source_row * feature_count + feature];
+    }
+}
+
+// Draw columns from a Walker-Vose alias table and form importance scales.
+__global__ void sample_leverage_columns(const float* probabilities,
+                                        const float* alias_probabilities,
+                                        const int* alias_indices, int feature_count,
+                                        const float* random_values,
+                                        std::size_t maximum_sample_count,
+                                        std::size_t requested_sample_count,
+                                        std::size_t* sampled_column_indices,
+                                        float* sampled_column_scales) {
+    const std::size_t sample_index =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (sample_index >= requested_sample_count)
         return;
-    const float uniform_probability = 1.0f / static_cast<float>(feature_count);
-    const float normalized_score =
-        score_sum > FLT_MIN ? probabilities[feature] / score_sum : uniform_probability;
-    probabilities[feature] =
-        (1.0f - uniform_mix) * normalized_score + uniform_mix * uniform_probability;
+
+    const int bucket = min(static_cast<int>(random_values[sample_index] * feature_count),
+                           feature_count - 1);
+    const float threshold = random_values[maximum_sample_count + sample_index];
+    const int selected_column = threshold <= alias_probabilities[bucket]
+                                    ? bucket
+                                    : alias_indices[bucket];
+    sampled_column_indices[sample_index] = static_cast<std::size_t>(selected_column);
+    sampled_column_scales[sample_index] =
+        rsqrtf(static_cast<float>(maximum_sample_count) *
+               fmaxf(probabilities[selected_column], FLT_MIN));
+}
+
+// Build a Walker-Vose table once from normalized leverage probabilities.
+void build_alias_table(std::vector<float>& probabilities,
+                       std::vector<float>& alias_probabilities,
+                       std::vector<int>& alias_indices) {
+    const int feature_count = static_cast<int>(probabilities.size());
+    double probability_sum = 0.0;
+    for (const float probability : probabilities)
+        probability_sum += probability;
+    if (probability_sum <= 0.0)
+        throw std::runtime_error("invalid leverage probability sum");
+
+    std::vector<double> scaled_probabilities(feature_count);
+    std::vector<int> small;
+    std::vector<int> large;
+    small.reserve(feature_count);
+    large.reserve(feature_count);
+    for (int feature = 0; feature < feature_count; ++feature) {
+        probabilities[feature] =
+            static_cast<float>(probabilities[feature] / probability_sum);
+        scaled_probabilities[feature] =
+            static_cast<double>(probabilities[feature]) * feature_count;
+        (scaled_probabilities[feature] < 1.0 ? small : large).push_back(feature);
+    }
+
+    alias_probabilities.assign(feature_count, 1.0f);
+    alias_indices.resize(feature_count);
+    while (!small.empty() && !large.empty()) {
+        const int small_feature = small.back();
+        small.pop_back();
+        const int large_feature = large.back();
+        large.pop_back();
+        alias_probabilities[small_feature] =
+            static_cast<float>(scaled_probabilities[small_feature]);
+        alias_indices[small_feature] = large_feature;
+        scaled_probabilities[large_feature] += scaled_probabilities[small_feature] - 1.0;
+        (scaled_probabilities[large_feature] < 1.0 ? small : large).push_back(large_feature);
+    }
+    for (const int feature : small)
+        alias_indices[feature] = feature;
+    for (const int feature : large)
+        alias_indices[feature] = feature;
 }
 } // namespace
 
-std::vector<float> estimate_column_leverage_probabilities(const DataParams* data_params,
-                                                          const RunParams* run_params,
-                                                          const std::vector<float>& features) {
-    const size_t sampled_row_count =
-        std::min(data_params->sample_count, run_params->leverage_row_count);
-    const size_t rank =
-        std::min({run_params->leverage_rank, sampled_row_count, data_params->feature_count});
-    const size_t basis_size = rank;
-    if (!sampled_row_count || !rank || !data_params->feature_count ||
-        data_params->sample_count > static_cast<size_t>(INT_MAX) ||
-        data_params->feature_count > static_cast<size_t>(INT_MAX) ||
-        sampled_row_count > static_cast<size_t>(INT_MAX) ||
-        basis_size > static_cast<size_t>(INT_MAX))
+// Build a randomized basis and retain normalized probabilities plus their alias table.
+void estimate_column_leverage_probabilities(const DataParams& data_params,
+                                            const RunParams& run_params,
+                                            const float* device_features,
+                                            float* device_probabilities,
+                                            float* device_alias_probabilities,
+                                            int* device_alias_indices) {
+    const std::size_t sampled_row_count =
+        std::min(data_params.sample_count, run_params.leverage_row_count);
+    const std::size_t rank =
+        std::min({run_params.leverage_rank, sampled_row_count, data_params.feature_count});
+    const std::size_t basis_size = rank;
+    if (!sampled_row_count || !rank || !data_params.feature_count ||
+        data_params.sample_count > static_cast<std::size_t>(INT_MAX) ||
+        data_params.feature_count > static_cast<std::size_t>(INT_MAX) ||
+        sampled_row_count > static_cast<std::size_t>(INT_MAX) ||
+        basis_size > static_cast<std::size_t>(INT_MAX))
         throw std::invalid_argument("invalid leverage dimensions");
 
     const int row_count = static_cast<int>(sampled_row_count);
-    const int feature_count = static_cast<int>(data_params->feature_count);
+    const int feature_count = static_cast<int>(data_params.feature_count);
     const int subspace_size = static_cast<int>(basis_size);
-    std::mt19937 random_generator(run_params->sketch_seed);
-    std::vector<size_t> shuffled_rows(data_params->sample_count);
-    std::iota(shuffled_rows.begin(), shuffled_rows.end(), 0);
-    std::shuffle(shuffled_rows.begin(), shuffled_rows.end(), random_generator);
-
-    // Row-major sampled features are column-major B^T to cuBLAS without a transpose copy.
-    std::vector<float> sampled_features(sampled_row_count * data_params->feature_count);
-    for (size_t sampled_row = 0; sampled_row < sampled_row_count; ++sampled_row)
-        std::copy_n(features.data() + shuffled_rows[sampled_row] * data_params->feature_count,
-                    data_params->feature_count,
-                    sampled_features.data() + sampled_row * data_params->feature_count);
-
-    std::normal_distribution<float> normal;
-    std::vector<float> random_basis(data_params->feature_count * basis_size);
-    for (float& value : random_basis)
-        value = normal(random_generator);
+    const std::size_t sampled_element_count = sampled_row_count * data_params.feature_count;
+    const std::size_t random_basis_element_count = data_params.feature_count * basis_size;
+    const std::size_t generated_normal_count =
+        random_basis_element_count + random_basis_element_count % 2;
+    CurandGenerator random_generator(run_params.sketch_seed);
 
     cublasHandle_t cublas_handle = nullptr;
     cusolverDnHandle_t solver_handle = nullptr;
+    double* device_random_rows = nullptr;
     float* device_sampled_features = nullptr;
     float* device_random_basis = nullptr;
     float* device_left_basis = nullptr;
     float* device_right_basis = nullptr;
     float* device_tau = nullptr;
     float* device_solver_workspace = nullptr;
-    float* device_probabilities = nullptr;
     int* device_info = nullptr;
 
     try {
         check_cublas(cublasCreate(&cublas_handle));
         check_cusolver(cusolverDnCreate(&solver_handle));
-        check_cuda(cudaMalloc(&device_sampled_features, sampled_features.size() * sizeof(float)));
-        check_cuda(cudaMalloc(&device_random_basis, random_basis.size() * sizeof(float)));
+        check_cuda(cudaMalloc(&device_random_rows, sampled_row_count * sizeof(double)));
+        check_cuda(cudaMalloc(&device_sampled_features, sampled_element_count * sizeof(float)));
+        check_cuda(cudaMalloc(&device_random_basis, generated_normal_count * sizeof(float)));
         check_cuda(cudaMalloc(&device_left_basis, sampled_row_count * basis_size * sizeof(float)));
         check_cuda(cudaMalloc(&device_right_basis,
-                              data_params->feature_count * basis_size * sizeof(float)));
+                              data_params.feature_count * basis_size * sizeof(float)));
         check_cuda(cudaMalloc(&device_tau, basis_size * sizeof(float)));
-        check_cuda(cudaMalloc(&device_probabilities, data_params->feature_count * sizeof(float)));
         check_cuda(cudaMalloc(&device_info, sizeof(int)));
-        check_cuda(cudaMemcpy(device_sampled_features, sampled_features.data(),
-                              sampled_features.size() * sizeof(float), cudaMemcpyHostToDevice));
-        check_cuda(cudaMemcpy(device_random_basis, random_basis.data(),
-                              random_basis.size() * sizeof(float), cudaMemcpyHostToDevice));
+        if (sampled_row_count != data_params.sample_count)
+            random_generator.generate_uniform(device_random_rows, sampled_row_count);
+        random_generator.generate_normal(device_random_basis, generated_normal_count);
+        constexpr int threads_per_block = 256;
+        const unsigned int gather_block_count =
+            static_cast<unsigned int>(std::min<std::size_t>(sampled_row_count, 65535));
+        gather_sampled_rows<<<gather_block_count, threads_per_block>>>(
+            device_features, device_sampled_features, device_random_rows,
+            data_params.sample_count, data_params.feature_count, sampled_row_count);
+        check_cuda(cudaGetLastError());
 
         int left_geqrf_workspace_size = 0;
         int left_orgqr_workspace_size = 0;
@@ -145,7 +227,7 @@ std::vector<float> estimate_column_leverage_probabilities(const DataParams* data
             std::max({left_geqrf_workspace_size, left_orgqr_workspace_size,
                       right_geqrf_workspace_size, right_orgqr_workspace_size});
         check_cuda(cudaMalloc(&device_solver_workspace,
-                              static_cast<size_t>(solver_workspace_size) * sizeof(float)));
+                              static_cast<std::size_t>(solver_workspace_size) * sizeof(float)));
 
         constexpr float one = 1.0f;
         constexpr float zero = 0.0f;
@@ -166,43 +248,46 @@ std::vector<float> estimate_column_leverage_probabilities(const DataParams* data
         orthonormalize_columns(solver_handle, device_right_basis, feature_count, subspace_size,
                                device_tau, device_solver_workspace, solver_workspace_size,
                                device_info);
-        constexpr int threads_per_block = 256;
         const int block_count = (feature_count + threads_per_block - 1) / threads_per_block;
-        calculate_leverage_scores<<<block_count, threads_per_block>>>(
-            device_right_basis, device_probabilities, feature_count, subspace_size);
+        const float uniform_mix = std::clamp(run_params.uniform_probability_mix, 0.0f, 1.0f);
+        calculate_leverage_probabilities<<<block_count, threads_per_block>>>(
+            device_right_basis, device_probabilities, feature_count, subspace_size, uniform_mix);
         check_cuda(cudaGetLastError());
 
-        float leverage_sum = 0.0f;
-        check_cublas(
-            cublasSasum(cublas_handle, feature_count, device_probabilities, 1, &leverage_sum));
-        const float uniform_mix = std::clamp(run_params->uniform_probability_mix, 0.0f, 1.0f);
-        normalize_leverage_scores<<<block_count, threads_per_block>>>(
-            device_probabilities, feature_count, leverage_sum, uniform_mix);
-        check_cuda(cudaGetLastError());
+        std::vector<float> host_probabilities(feature_count);
+        std::vector<float> host_alias_probabilities;
+        std::vector<int> host_alias_indices;
+        check_cuda(cudaMemcpy(host_probabilities.data(), device_probabilities,
+                              host_probabilities.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        build_alias_table(host_probabilities, host_alias_probabilities, host_alias_indices);
+        check_cuda(cudaMemcpy(device_probabilities, host_probabilities.data(),
+                              host_probabilities.size() * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        check_cuda(cudaMemcpy(device_alias_probabilities, host_alias_probabilities.data(),
+                              host_alias_probabilities.size() * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        check_cuda(cudaMemcpy(device_alias_indices, host_alias_indices.data(),
+                              host_alias_indices.size() * sizeof(int), cudaMemcpyHostToDevice));
 
-        std::vector<float> probabilities(data_params->feature_count);
-        check_cuda(cudaMemcpy(probabilities.data(), device_probabilities,
-                              probabilities.size() * sizeof(float), cudaMemcpyDeviceToHost));
-
+        cudaFree(device_random_rows);
         cudaFree(device_sampled_features);
         cudaFree(device_random_basis);
         cudaFree(device_left_basis);
         cudaFree(device_right_basis);
         cudaFree(device_tau);
         cudaFree(device_solver_workspace);
-        cudaFree(device_probabilities);
         cudaFree(device_info);
         cusolverDnDestroy(solver_handle);
         cublasDestroy(cublas_handle);
-        return probabilities;
     } catch (...) {
+        cudaFree(device_random_rows);
         cudaFree(device_sampled_features);
         cudaFree(device_random_basis);
         cudaFree(device_left_basis);
         cudaFree(device_right_basis);
         cudaFree(device_tau);
         cudaFree(device_solver_workspace);
-        cudaFree(device_probabilities);
         cudaFree(device_info);
         cusolverDnDestroy(solver_handle);
         cublasDestroy(cublas_handle);
@@ -210,19 +295,24 @@ std::vector<float> estimate_column_leverage_probabilities(const DataParams* data
     }
 }
 
-void sample_leverage_columns(const std::vector<float>& probabilities, size_t requested_sample_count,
-                             unsigned int seed, std::vector<size_t>& sampled_column_indices,
-                             std::vector<float>& sampled_column_scales) {
-    if (probabilities.empty() || !requested_sample_count)
+// Convert device uniform draws into leverage-sampled feature indices and importance scales.
+void cuda_sample_leverage_columns(cudaStream_t stream, const float* device_probabilities,
+                                  const float* device_alias_probabilities,
+                                  const int* device_alias_indices,
+                                  std::size_t feature_count, const float* device_random_values,
+                                  std::size_t maximum_sample_count,
+                                  std::size_t requested_sample_count,
+                                  std::size_t* device_sampled_column_indices,
+                                  float* device_sampled_column_scales) {
+    if (!feature_count || !requested_sample_count || requested_sample_count > maximum_sample_count ||
+        feature_count > static_cast<std::size_t>(INT_MAX))
         throw std::invalid_argument("empty feature sample");
-    std::mt19937 random_generator(seed + 2);
-    std::discrete_distribution<size_t> draw_column(probabilities.begin(), probabilities.end());
-    sampled_column_indices.resize(requested_sample_count);
-    sampled_column_scales.resize(requested_sample_count);
-    for (size_t sample_index = 0; sample_index < requested_sample_count; ++sample_index) {
-        sampled_column_indices[sample_index] = draw_column(random_generator);
-        sampled_column_scales[sample_index] =
-            1.0f / std::sqrt(float(requested_sample_count) *
-                             probabilities[sampled_column_indices[sample_index]]);
-    }
+    constexpr int threads_per_block = 256;
+    const std::size_t block_count =
+        (requested_sample_count + threads_per_block - 1) / threads_per_block;
+    sample_leverage_columns<<<static_cast<unsigned int>(block_count), threads_per_block, 0, stream>>>(
+        device_probabilities, device_alias_probabilities, device_alias_indices,
+        static_cast<int>(feature_count), device_random_values, maximum_sample_count,
+        requested_sample_count, device_sampled_column_indices, device_sampled_column_scales);
+    check_cuda(cudaGetLastError());
 }

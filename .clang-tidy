@@ -10,7 +10,7 @@ Checks: >
   -performance-enum-size,
   -portability-avoid-pragma-once
 WarningsAsErrors: '*'
-HeaderFilterRegex: '(^|/)(feature_sampling|libsvm_loader|prefetch|s_step_sgd)\.hpp$'
+HeaderFilterRegex: '(^|/)(dataset_loader|feature_sampling|prefetch|s_step_sgd)\.hpp$'
 FormatStyle: file
 CheckOptions:
   bugprone-assert-side-effect.AssertMacros: 'assert'

@@ -1,10 +1,11 @@
 #pragma once
 
 #include <cublas_v2.h>
+#include <curand.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <source_location>
 #include <stdexcept>
@@ -12,11 +13,13 @@
 #include <utility>
 #include <vector>
 
+// Format a source location for CUDA and cuBLAS error messages.
 inline std::string call_site(const std::source_location& location) {
     return std::string(location.file_name()) + ":" + std::to_string(location.line()) + " in " +
            location.function_name();
 }
 
+// Throw a source-aware exception when a CUDA Runtime call fails.
 inline void check_cuda(cudaError_t status,
                        const std::source_location& location = std::source_location::current()) {
     if (status != cudaSuccess) {
@@ -25,6 +28,7 @@ inline void check_cuda(cudaError_t status,
     }
 }
 
+// Throw a source-aware exception when a cuBLAS call fails.
 inline void check_cublas(cublasStatus_t status,
                          const std::source_location& location = std::source_location::current()) {
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -32,6 +36,360 @@ inline void check_cublas(cublasStatus_t status,
                                  std::to_string(static_cast<int>(status)));
     }
 }
+
+// Throw a source-aware exception when a cuRAND call fails.
+inline void check_curand(curandStatus_t status,
+                         const std::source_location& location = std::source_location::current()) {
+    if (status != CURAND_STATUS_SUCCESS) {
+        throw std::runtime_error("cuRAND error at " + call_site(location) + ": status " +
+                                 std::to_string(static_cast<int>(status)));
+    }
+}
+
+template <typename T> class DeviceBuffer {
+  public:
+    // Create an empty device allocation owner.
+    DeviceBuffer() = default;
+    // Allocate storage for the requested number of device elements.
+    explicit DeviceBuffer(std::size_t count) {
+        allocate(count);
+    }
+    // Release the owned device allocation.
+    ~DeviceBuffer() {
+        cudaFree(pointer_);
+    }
+
+    // Prevent two objects from owning the same device allocation.
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    // Prevent copy assignment of device allocation ownership.
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    // Transfer device allocation ownership from another buffer.
+    DeviceBuffer(DeviceBuffer&& other) noexcept
+        : pointer_(std::exchange(other.pointer_, nullptr)) {}
+    // Release the current allocation and take ownership from another buffer.
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            cudaFree(pointer_);
+            pointer_ = std::exchange(other.pointer_, nullptr);
+        }
+        return *this;
+    }
+
+    // Replace the current allocation with storage for count device elements.
+    void allocate(std::size_t count) {
+        T* allocation = nullptr;
+        check_cuda(cudaMalloc(&allocation, count * sizeof(T)));
+        cudaFree(pointer_);
+        pointer_ = allocation;
+    }
+
+    // Expose the owned allocation to CUDA APIs expecting a raw pointer.
+    operator T*() const {
+        return pointer_;
+    }
+
+  private:
+    T* pointer_{nullptr};
+};
+
+template <typename T> class PinnedBuffer {
+  public:
+    // Create an empty pinned-host allocation owner.
+    PinnedBuffer() = default;
+    // Allocate pinned host storage for the requested number of elements.
+    explicit PinnedBuffer(std::size_t count) {
+        allocate(count);
+    }
+    // Release the owned pinned-host allocation.
+    ~PinnedBuffer() {
+        cudaFreeHost(pointer_);
+    }
+
+    // Prevent two objects from owning the same pinned-host allocation.
+    PinnedBuffer(const PinnedBuffer&) = delete;
+    // Prevent copy assignment of pinned-host allocation ownership.
+    PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+    // Transfer pinned-host allocation ownership from another buffer.
+    PinnedBuffer(PinnedBuffer&& other) noexcept
+        : pointer_(std::exchange(other.pointer_, nullptr)) {}
+    // Release the current allocation and take ownership from another buffer.
+    PinnedBuffer& operator=(PinnedBuffer&& other) noexcept {
+        if (this != &other) {
+            cudaFreeHost(pointer_);
+            pointer_ = std::exchange(other.pointer_, nullptr);
+        }
+        return *this;
+    }
+
+    // Replace the current allocation with pinned storage for count elements.
+    void allocate(std::size_t count) {
+        T* allocation = nullptr;
+        check_cuda(cudaMallocHost(&allocation, count * sizeof(T)));
+        cudaFreeHost(pointer_);
+        pointer_ = allocation;
+    }
+
+    // Expose the owned allocation to CUDA APIs expecting a raw pointer.
+    operator T*() const {
+        return pointer_;
+    }
+    // Access the first object stored in the pinned allocation.
+    T& operator*() const {
+        return *pointer_;
+    }
+
+  private:
+    T* pointer_{nullptr};
+};
+
+class CudaStream {
+  public:
+    // Create a CUDA stream with the requested behavior flags.
+    explicit CudaStream(unsigned int flags = cudaStreamNonBlocking) {
+        check_cuda(cudaStreamCreateWithFlags(&stream_, flags));
+    }
+    // Destroy the owned CUDA stream.
+    ~CudaStream() {
+        if (stream_)
+            cudaStreamDestroy(stream_);
+    }
+
+    // Prevent two objects from owning the same CUDA stream.
+    CudaStream(const CudaStream&) = delete;
+    // Prevent copy assignment of CUDA stream ownership.
+    CudaStream& operator=(const CudaStream&) = delete;
+    // Transfer CUDA stream ownership from another object.
+    CudaStream(CudaStream&& other) noexcept : stream_(std::exchange(other.stream_, nullptr)) {}
+    // Destroy the current stream and take ownership of another stream.
+    CudaStream& operator=(CudaStream&& other) noexcept {
+        if (this != &other) {
+            if (stream_)
+                cudaStreamDestroy(stream_);
+            stream_ = std::exchange(other.stream_, nullptr);
+        }
+        return *this;
+    }
+
+    // Expose the owned stream handle to CUDA APIs.
+    operator cudaStream_t() const {
+        return stream_;
+    }
+
+  private:
+    cudaStream_t stream_{nullptr};
+};
+
+class CudaEvent {
+  public:
+    // Create a CUDA event with the requested behavior flags.
+    explicit CudaEvent(unsigned int flags = cudaEventDisableTiming) {
+        check_cuda(cudaEventCreateWithFlags(&event_, flags));
+    }
+    // Destroy the owned CUDA event.
+    ~CudaEvent() {
+        if (event_)
+            cudaEventDestroy(event_);
+    }
+
+    // Prevent two objects from owning the same CUDA event.
+    CudaEvent(const CudaEvent&) = delete;
+    // Prevent copy assignment of CUDA event ownership.
+    CudaEvent& operator=(const CudaEvent&) = delete;
+    // Transfer CUDA event ownership from another object.
+    CudaEvent(CudaEvent&& other) noexcept : event_(std::exchange(other.event_, nullptr)) {}
+    // Destroy the current event and take ownership of another event.
+    CudaEvent& operator=(CudaEvent&& other) noexcept {
+        if (this != &other) {
+            if (event_)
+                cudaEventDestroy(event_);
+            event_ = std::exchange(other.event_, nullptr);
+        }
+        return *this;
+    }
+
+    // Expose the owned event handle to CUDA APIs.
+    operator cudaEvent_t() const {
+        return event_;
+    }
+
+  private:
+    cudaEvent_t event_{nullptr};
+};
+
+class CublasHandle {
+  public:
+    // Create a cuBLAS library handle.
+    CublasHandle() {
+        check_cublas(cublasCreate(&handle_));
+    }
+    // Destroy the owned cuBLAS handle.
+    ~CublasHandle() {
+        if (handle_)
+            cublasDestroy(handle_);
+    }
+
+    // Prevent two objects from owning the same cuBLAS handle.
+    CublasHandle(const CublasHandle&) = delete;
+    // Prevent copy assignment of cuBLAS handle ownership.
+    CublasHandle& operator=(const CublasHandle&) = delete;
+    // Transfer cuBLAS handle ownership from another object.
+    CublasHandle(CublasHandle&& other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+    // Destroy the current handle and take ownership of another handle.
+    CublasHandle& operator=(CublasHandle&& other) noexcept {
+        if (this != &other) {
+            if (handle_)
+                cublasDestroy(handle_);
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
+
+    // Expose the owned handle to cuBLAS APIs.
+    operator cublasHandle_t() const {
+        return handle_;
+    }
+
+  private:
+    cublasHandle_t handle_{nullptr};
+};
+
+class CurandGenerator {
+  public:
+    // Create a seeded Philox generator for asynchronous device sampling.
+    explicit CurandGenerator(unsigned long long seed) {
+        check_curand(curandCreateGenerator(&generator_, CURAND_RNG_PSEUDO_PHILOX4_32_10));
+        try {
+            check_curand(curandSetPseudoRandomGeneratorSeed(generator_, seed));
+        } catch (...) {
+            curandDestroyGenerator(generator_);
+            generator_ = nullptr;
+            throw;
+        }
+    }
+    // Destroy the owned cuRAND generator.
+    ~CurandGenerator() {
+        if (generator_)
+            curandDestroyGenerator(generator_);
+    }
+
+    // Prevent two objects from owning the same cuRAND generator.
+    CurandGenerator(const CurandGenerator&) = delete;
+    // Prevent copy assignment of cuRAND generator ownership.
+    CurandGenerator& operator=(const CurandGenerator&) = delete;
+    // Transfer cuRAND generator ownership from another object.
+    CurandGenerator(CurandGenerator&& other) noexcept
+        : generator_(std::exchange(other.generator_, nullptr)) {}
+    // Destroy the current generator and take ownership of another generator.
+    CurandGenerator& operator=(CurandGenerator&& other) noexcept {
+        if (this != &other) {
+            if (generator_)
+                curandDestroyGenerator(generator_);
+            generator_ = std::exchange(other.generator_, nullptr);
+        }
+        return *this;
+    }
+
+    // Queue future random-number generation on the selected CUDA stream.
+    void set_stream(cudaStream_t stream) {
+        check_curand(curandSetStream(generator_, stream));
+    }
+    // Fill a device buffer with uniform random values in the interval (0, 1].
+    void generate_uniform(float* values, std::size_t count) {
+        check_curand(curandGenerateUniform(generator_, values, count));
+    }
+    // Fill a device buffer with double-precision uniform random values in (0, 1].
+    void generate_uniform(double* values, std::size_t count) {
+        check_curand(curandGenerateUniformDouble(generator_, values, count));
+    }
+    // Fill a device buffer with normally distributed random values.
+    void generate_normal(float* values, std::size_t count, float mean = 0.0f,
+                         float standard_deviation = 1.0f) {
+        check_curand(curandGenerateNormal(generator_, values, count, mean, standard_deviation));
+    }
+
+  private:
+    curandGenerator_t generator_{nullptr};
+};
+
+class CudaGraph {
+  public:
+    // Create an empty CUDA graph owner for later capture.
+    CudaGraph() = default;
+    // Destroy the owned CUDA graph.
+    ~CudaGraph() {
+        if (graph_)
+            cudaGraphDestroy(graph_);
+    }
+
+    // Prevent two objects from owning the same CUDA graph.
+    CudaGraph(const CudaGraph&) = delete;
+    // Prevent copy assignment of CUDA graph ownership.
+    CudaGraph& operator=(const CudaGraph&) = delete;
+    // Transfer CUDA graph ownership from another object.
+    CudaGraph(CudaGraph&& other) noexcept : graph_(std::exchange(other.graph_, nullptr)) {}
+    // Destroy the current graph and take ownership of another graph.
+    CudaGraph& operator=(CudaGraph&& other) noexcept {
+        if (this != &other) {
+            if (graph_)
+                cudaGraphDestroy(graph_);
+            graph_ = std::exchange(other.graph_, nullptr);
+        }
+        return *this;
+    }
+
+    // Return the graph-handle address for CUDA output parameters.
+    cudaGraph_t* put() {
+        return &graph_;
+    }
+    // Expose the owned graph handle to CUDA APIs.
+    operator cudaGraph_t() const {
+        return graph_;
+    }
+
+  private:
+    cudaGraph_t graph_{nullptr};
+};
+
+class CudaGraphExec {
+  public:
+    // Create an empty executable-graph owner for later instantiation.
+    CudaGraphExec() = default;
+    // Destroy the owned executable CUDA graph.
+    ~CudaGraphExec() {
+        if (executable_)
+            cudaGraphExecDestroy(executable_);
+    }
+
+    // Prevent two objects from owning the same executable graph.
+    CudaGraphExec(const CudaGraphExec&) = delete;
+    // Prevent copy assignment of executable-graph ownership.
+    CudaGraphExec& operator=(const CudaGraphExec&) = delete;
+    // Transfer executable-graph ownership from another object.
+    CudaGraphExec(CudaGraphExec&& other) noexcept
+        : executable_(std::exchange(other.executable_, nullptr)) {}
+    // Destroy the current executable and take ownership of another one.
+    CudaGraphExec& operator=(CudaGraphExec&& other) noexcept {
+        if (this != &other) {
+            if (executable_)
+                cudaGraphExecDestroy(executable_);
+            executable_ = std::exchange(other.executable_, nullptr);
+        }
+        return *this;
+    }
+
+    // Return the executable-handle address for CUDA output parameters.
+    cudaGraphExec_t* put() {
+        return &executable_;
+    }
+    // Expose the owned executable graph handle to CUDA APIs.
+    operator cudaGraphExec_t() const {
+        return executable_;
+    }
+
+  private:
+    cudaGraphExec_t executable_{nullptr};
+};
 
 struct ProfileStats {
     float training_time_ms{0.0f};
@@ -44,41 +402,26 @@ struct RunParams {
     int iteration_count{100};
     int print_interval{0};
     float learning_rate{0.5f};
-    size_t requested_sampled_feature_count{64};
-    size_t leverage_rank{32};
-    size_t leverage_row_count{512};
+    std::size_t requested_sampled_feature_count{512};
+    std::size_t fixed_sampled_feature_count{0};
+    std::size_t leverage_rank{32};
+    std::size_t leverage_row_count{512};
     float uniform_probability_mix{0.1f};
     unsigned int sketch_seed{0};
+    bool trace_controller{false};
+    int checkpoint_interval{0};
+    std::string checkpoint_prefix{};
 };
 
-inline size_t stochastic_sampled_feature_count(float correction_ratio, float random_draw,
-                                               size_t maximum_sampled_feature_count) {
-    correction_ratio = correction_ratio > 0.0f ? correction_ratio : 0.0f;
-    random_draw = std::clamp(random_draw, 0.0f, 1.0f);
-    size_t lower_count = 8;
-    size_t upper_count = 16;
-    float upper_probability = correction_ratio / 0.01f;
-    if (correction_ratio >= 0.05f) {
-        lower_count = 32;
-        upper_count = 64;
-        upper_probability = (correction_ratio - 0.05f) / 0.15f;
-    } else if (correction_ratio >= 0.01f) {
-        lower_count = 16;
-        upper_count = 32;
-        upper_probability = (correction_ratio - 0.01f) / 0.04f;
-    }
-    const size_t selected_count =
-        random_draw < std::clamp(upper_probability, 0.0f, 1.0f) ? upper_count : lower_count;
-    return std::min(selected_count, maximum_sampled_feature_count);
-}
+inline constexpr std::array<std::size_t, 8> adaptive_sampled_feature_counts{
+    2, 4, 8, 16, 32, 64, 128, 256};
 
 struct DataParams {
     std::string dataset_path{};
-    size_t feature_count{300};
-    size_t sample_count{0};
-    size_t padded_sample_count{0};
+    std::size_t feature_count{300};
+    std::size_t sample_count{0};
+    std::size_t padded_sample_count{0};
     std::uint64_t dataset_seed{0};
-    bool is_sstep_binary{false};
 };
 
 struct MetricSums {
@@ -86,244 +429,160 @@ struct MetricSums {
     unsigned long long correct_count{0};
 };
 
+// Return the temporary storage required by the device-wide metric reduction.
+std::size_t cuda_metric_reduction_workspace_size(std::size_t sample_count);
+
 struct RecurrenceStats {
     float corrected_residual_difference_squared_sum{0.0f};
     float base_residual_squared_sum{0.0f};
 };
 
 struct LeverageSketch {
-    std::vector<size_t> sampled_column_indices{};
-    std::vector<float> sampled_column_scales{};
-    std::vector<size_t> sampled_feature_counts{};
-    std::vector<size_t> sketch_offsets{};
-    size_t* device_sampled_column_indices{nullptr};
-    float* device_sampled_column_scales{nullptr};
-    size_t sampled_feature_count{0};
-    size_t sketch_count{0};
+    std::vector<std::size_t> sampled_feature_counts{};
+    DeviceBuffer<float> device_probabilities{};
+    DeviceBuffer<float> device_alias_probabilities{};
+    DeviceBuffer<int> device_alias_indices{};
+    std::size_t sampled_feature_count{0};
+    std::size_t sketch_count{0};
 
+    // Create an empty leverage-sampling plan.
     LeverageSketch() = default;
-    ~LeverageSketch() {
-        cudaFree(device_sampled_column_indices);
-        cudaFree(device_sampled_column_scales);
-    }
+    // Prevent copies of the sketch's device allocations.
     LeverageSketch(const LeverageSketch&) = delete;
+    // Prevent copy assignment of the sketch's device allocations.
     LeverageSketch& operator=(const LeverageSketch&) = delete;
-    LeverageSketch(LeverageSketch&& other) noexcept
-        : sampled_column_indices(std::move(other.sampled_column_indices)),
-          sampled_column_scales(std::move(other.sampled_column_scales)),
-          sampled_feature_counts(std::move(other.sampled_feature_counts)),
-          sketch_offsets(std::move(other.sketch_offsets)),
-          device_sampled_column_indices(
-              std::exchange(other.device_sampled_column_indices, nullptr)),
-          device_sampled_column_scales(std::exchange(other.device_sampled_column_scales, nullptr)),
-          sampled_feature_count(other.sampled_feature_count), sketch_count(other.sketch_count) {}
-    LeverageSketch& operator=(LeverageSketch&& other) noexcept {
-        if (this != &other) {
-            cudaFree(device_sampled_column_indices);
-            cudaFree(device_sampled_column_scales);
-            sampled_column_indices = std::move(other.sampled_column_indices);
-            sampled_column_scales = std::move(other.sampled_column_scales);
-            sampled_feature_counts = std::move(other.sampled_feature_counts);
-            sketch_offsets = std::move(other.sketch_offsets);
-            device_sampled_column_indices =
-                std::exchange(other.device_sampled_column_indices, nullptr);
-            device_sampled_column_scales =
-                std::exchange(other.device_sampled_column_scales, nullptr);
-            sampled_feature_count = other.sampled_feature_count;
-            sketch_count = other.sketch_count;
-        }
-        return *this;
-    }
+    // Transfer the leverage-sampling plan and its device allocations.
+    LeverageSketch(LeverageSketch&&) noexcept = default;
+    // Replace this plan by moving another leverage-sampling plan into it.
+    LeverageSketch& operator=(LeverageSketch&&) noexcept = default;
 
-    size_t size() const {
+    // Return the maximum number of feature samples generated for each block.
+    std::size_t size() const {
         return sampled_feature_count;
     }
 
-    size_t size(size_t sketch_index) const {
+    // Return the active sampled width selected for one block.
+    std::size_t size(std::size_t sketch_index) const {
         return sampled_feature_counts.at(sketch_index);
-    }
-
-    size_t offset(size_t sketch_index) const {
-        return sketch_offsets.at(sketch_index);
-    }
-
-    void upload() {
-        check_cuda(cudaMalloc(&device_sampled_column_indices,
-                              sampled_column_indices.size() * sizeof(size_t)));
-        check_cuda(cudaMalloc(&device_sampled_column_scales,
-                              sampled_column_scales.size() * sizeof(float)));
-        check_cuda(cudaMemcpy(device_sampled_column_indices, sampled_column_indices.data(),
-                              sampled_column_indices.size() * sizeof(size_t),
-                              cudaMemcpyHostToDevice));
-        check_cuda(cudaMemcpy(device_sampled_column_scales, sampled_column_scales.data(),
-                              sampled_column_scales.size() * sizeof(float),
-                              cudaMemcpyHostToDevice));
     }
 };
 
 struct SampledBatchSlot {
-    float* device_sampled_features{nullptr};
-    cudaEvent_t prefetch_done{nullptr};
-    cudaEvent_t compute_done{nullptr};
+    DeviceBuffer<float> device_sampled_features{};
+    DeviceBuffer<float> device_approximate_gram{};
+    DeviceBuffer<float> device_random_values{};
+    DeviceBuffer<std::size_t> device_sampled_column_indices{};
+    DeviceBuffer<float> device_sampled_column_scales{};
+    CudaEvent prefetch_done{};
+    CudaEvent compute_done{};
+};
+
+struct ControllerStatsSlot {
+    PinnedBuffer<RecurrenceStats> host_stats{};
+    CudaEvent copy_done{};
+    std::size_t sampled_feature_count{0};
 };
 
 struct RecurrenceGraph {
-    size_t slot_index{0};
-    size_t sampled_feature_count{0};
-    cudaGraph_t graph{nullptr};
-    cudaGraphExec_t executable{nullptr};
+    std::size_t slot_index{0};
+    CudaGraph graph{};
+    CudaGraphExec executable{};
 };
 
 struct Workspace {
-    float* device_features{nullptr};
-    float* device_labels{nullptr};
-    float* device_weights{nullptr};
-    float* device_signed_features{nullptr};
-    float* device_block_margins_or_residuals{nullptr};
-    float* device_projected_gradient_prefix{nullptr};
-    float* device_base_residuals{nullptr};
-    float* device_metric_margins{nullptr};
-    MetricSums* device_metric_sums{nullptr};
-    RecurrenceStats* device_recurrence_stats{nullptr};
-    RecurrenceStats* host_recurrence_stats{nullptr};
+    DeviceBuffer<float> device_labels{};
+    DeviceBuffer<float> device_weights{};
+    DeviceBuffer<float> device_signed_features{};
+    DeviceBuffer<float> device_block_margins_or_residuals{};
+    DeviceBuffer<float> device_base_residuals{};
+    DeviceBuffer<float> device_metric_margins{};
+    DeviceBuffer<MetricSums> device_metric_sums{};
+    DeviceBuffer<std::byte> device_metric_reduction_workspace{};
+    std::size_t metric_reduction_workspace_size{0};
+    DeviceBuffer<RecurrenceStats> device_recurrence_stats{};
     LeverageSketch leverage_sketch{};
 
-    cudaStream_t prefetch_stream{nullptr};
-    cudaStream_t compute_stream{nullptr};
-    cudaEvent_t recurrence_stats_copy_done{nullptr};
-    cublasHandle_t cublas_handle{nullptr};
+    CudaStream prefetch_stream{};
+    CudaStream compute_stream{};
+    CublasHandle cublas_handle{};
+    CublasHandle prefetch_cublas_handle{};
+    CurandGenerator random_generator;
     std::array<SampledBatchSlot, 2> sampled_batch_slots{};
+    // Limit host submission to two blocks ahead so adaptive decisions remain timely.
+    std::array<ControllerStatsSlot, 2> controller_stats_slots{};
     std::vector<RecurrenceGraph> recurrence_graphs{};
-    size_t current_slot_index{0};
+    std::size_t current_slot_index{0};
 
-    Workspace(const DataParams* data_params, const RunParams* run_params,
-              LeverageSketch initial_leverage_sketch)
-        : device_features(nullptr), device_labels(nullptr), device_weights(nullptr),
-          device_signed_features(nullptr), device_block_margins_or_residuals(nullptr),
-          device_projected_gradient_prefix(nullptr), device_base_residuals(nullptr),
-          device_metric_margins(nullptr), device_metric_sums(nullptr),
-          device_recurrence_stats(nullptr), host_recurrence_stats(nullptr),
-          leverage_sketch(std::move(initial_leverage_sketch)), prefetch_stream(nullptr),
-          compute_stream(nullptr), recurrence_stats_copy_done(nullptr), cublas_handle(nullptr),
-          sampled_batch_slots{}, recurrence_graphs{}, current_slot_index(0) {
-        const size_t dataset_element_count =
-            data_params->padded_sample_count * data_params->feature_count;
-        const size_t sampled_element_count =
-            run_params->samples_per_iteration * leverage_sketch.size();
-        try {
-            check_cuda(cudaStreamCreateWithFlags(&prefetch_stream, cudaStreamNonBlocking));
-            check_cuda(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
-            check_cuda(
-                cudaEventCreateWithFlags(&recurrence_stats_copy_done, cudaEventDisableTiming));
-            check_cublas(cublasCreate(&cublas_handle));
+    // Allocate persistent GPU resources and configure cuBLAS for training.
+    Workspace(const DataParams& data_params, const RunParams& run_params,
+              LeverageSketch initial_leverage_sketch,
+              DeviceBuffer<float> initial_device_features)
+        : device_signed_features(std::move(initial_device_features)),
+          leverage_sketch(std::move(initial_leverage_sketch)),
+          random_generator(static_cast<unsigned long long>(run_params.sketch_seed) + 2ULL) {
+        const std::size_t sampled_element_count =
+            run_params.samples_per_iteration * leverage_sketch.size();
+        device_labels.allocate(data_params.padded_sample_count);
+        device_weights.allocate(data_params.feature_count);
+        device_block_margins_or_residuals.allocate(run_params.samples_per_iteration);
+        device_metric_margins.allocate(data_params.sample_count);
+        device_metric_sums.allocate(1);
+        metric_reduction_workspace_size =
+            cuda_metric_reduction_workspace_size(data_params.sample_count);
+        device_metric_reduction_workspace.allocate(metric_reduction_workspace_size);
+        if (run_params.s > 1) {
+            const std::size_t sample_count =
+                static_cast<std::size_t>(run_params.samples_per_iteration);
+            device_base_residuals.allocate(run_params.samples_per_iteration);
+            device_recurrence_stats.allocate(1);
             for (auto& batch_slot : sampled_batch_slots) {
-                check_cuda(
-                    cudaEventCreateWithFlags(&batch_slot.prefetch_done, cudaEventDisableTiming));
-                check_cuda(
-                    cudaEventCreateWithFlags(&batch_slot.compute_done, cudaEventDisableTiming));
+                batch_slot.device_sampled_features.allocate(sampled_element_count);
+                batch_slot.device_approximate_gram.allocate(sample_count * sample_count);
+                batch_slot.device_random_values.allocate(2 * leverage_sketch.size());
+                batch_slot.device_sampled_column_indices.allocate(leverage_sketch.size());
+                batch_slot.device_sampled_column_scales.allocate(leverage_sketch.size());
             }
-            check_cuda(cudaMalloc(&device_features, dataset_element_count * sizeof(float)));
-            check_cuda(
-                cudaMalloc(&device_labels, data_params->padded_sample_count * sizeof(float)));
-            check_cuda(cudaMalloc(&device_weights, data_params->feature_count * sizeof(float)));
-            check_cuda(cudaMalloc(&device_signed_features, dataset_element_count * sizeof(float)));
-            check_cuda(cudaMalloc(&device_block_margins_or_residuals,
-                                  run_params->samples_per_iteration * sizeof(float)));
-            check_cuda(cudaMalloc(&device_projected_gradient_prefix,
-                                  run_params->s * leverage_sketch.size() * sizeof(float)));
-            check_cuda(cudaMalloc(&device_base_residuals,
-                                  run_params->samples_per_iteration * sizeof(float)));
-            check_cuda(
-                cudaMalloc(&device_metric_margins, data_params->sample_count * sizeof(float)));
-            check_cuda(cudaMalloc(&device_metric_sums, sizeof(MetricSums)));
-            check_cuda(cudaMalloc(&device_recurrence_stats, sizeof(RecurrenceStats)));
-            check_cuda(cudaMallocHost(&host_recurrence_stats, sizeof(RecurrenceStats)));
-            for (auto& batch_slot : sampled_batch_slots) {
-                check_cuda(cudaMalloc(&batch_slot.device_sampled_features,
-                                      sampled_element_count * sizeof(float)));
-            }
-
-            check_cublas(cublasSetMathMode(cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH));
-            check_cublas(cublasSetStream(cublas_handle, compute_stream));
-        } catch (...) {
-            for (auto& recurrence_graph : recurrence_graphs) {
-                cudaGraphExecDestroy(recurrence_graph.executable);
-                cudaGraphDestroy(recurrence_graph.graph);
-            }
-            cudaFree(device_features);
-            cudaFree(device_labels);
-            cudaFree(device_weights);
-            cudaFree(device_signed_features);
-            cudaFree(device_block_margins_or_residuals);
-            cudaFree(device_projected_gradient_prefix);
-            cudaFree(device_base_residuals);
-            cudaFree(device_metric_margins);
-            cudaFree(device_metric_sums);
-            cudaFree(device_recurrence_stats);
-            cudaFreeHost(host_recurrence_stats);
-            for (auto& batch_slot : sampled_batch_slots) {
-                cudaFree(batch_slot.device_sampled_features);
-                cudaEventDestroy(batch_slot.prefetch_done);
-                cudaEventDestroy(batch_slot.compute_done);
-            }
-            cudaEventDestroy(recurrence_stats_copy_done);
-            cublasDestroy(cublas_handle);
-            cudaStreamDestroy(compute_stream);
-            cudaStreamDestroy(prefetch_stream);
-            throw;
+            for (auto& stats_slot : controller_stats_slots)
+                stats_slot.host_stats.allocate(1);
         }
+
+        check_cublas(cublasSetMathMode(cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH));
+        check_cublas(cublasSetStream(cublas_handle, compute_stream));
+        check_cublas(cublasSetMathMode(prefetch_cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH));
+        check_cublas(cublasSetStream(prefetch_cublas_handle, prefetch_stream));
+        random_generator.set_stream(prefetch_stream);
     }
-
-    ~Workspace() {
-        for (auto& recurrence_graph : recurrence_graphs) {
-            cudaGraphExecDestroy(recurrence_graph.executable);
-            cudaGraphDestroy(recurrence_graph.graph);
-        }
-        cudaFree(device_features);
-        cudaFree(device_labels);
-        cudaFree(device_weights);
-        cudaFree(device_signed_features);
-        cudaFree(device_block_margins_or_residuals);
-        cudaFree(device_projected_gradient_prefix);
-        cudaFree(device_base_residuals);
-        cudaFree(device_metric_margins);
-        cudaFree(device_metric_sums);
-        cudaFree(device_recurrence_stats);
-        cudaFreeHost(host_recurrence_stats);
-        for (auto& batch_slot : sampled_batch_slots) {
-            cudaFree(batch_slot.device_sampled_features);
-            cudaEventDestroy(batch_slot.prefetch_done);
-            cudaEventDestroy(batch_slot.compute_done);
-        }
-        cudaEventDestroy(recurrence_stats_copy_done);
-        cublasDestroy(cublas_handle);
-        cudaStreamDestroy(compute_stream);
-        cudaStreamDestroy(prefetch_stream);
-    }
+    // Prevent copies of the workspace's GPU resources.
     Workspace(const Workspace&) = delete;
+    // Prevent moving a workspace whose internal operations reference its members.
     Workspace(Workspace&&) = delete;
+    // Prevent copy assignment of the workspace's GPU resources.
     Workspace& operator=(const Workspace&) = delete;
+    // Prevent move assignment of the workspace's GPU resources.
     Workspace& operator=(Workspace&&) = delete;
 };
 
-void enter_recurrence(const DataParams* data_params, const RunParams* run_params,
-                      Workspace* workspace, float* device_signed_batch,
-                      size_t sampled_feature_count);
+// Compute one block's base margins and launch its sampled recurrence graph.
+void enter_recurrence(const DataParams& data_params, const RunParams& run_params,
+                      Workspace* workspace, float* device_signed_batch);
 
+// Convert signed margins into logistic residuals on a CUDA stream.
 void cuda_sigmoid(cudaStream_t stream, const float* signed_margins, float* residuals,
-                  size_t sample_count);
+                  std::size_t sample_count);
+// Form corrected residuals and reduce the statistics used by the width controller.
 void cuda_corrected_sigmoid_and_accumulate(cudaStream_t stream, const float* corrected_margins,
                                            const float* base_residuals, float* corrected_residuals,
-                                           size_t sample_count, RecurrenceStats* recurrence_stats);
-void cuda_exclusive_prefix_columns(cudaStream_t stream, float* column_values, size_t column_count,
-                                   size_t row_count);
+                                           std::size_t sample_count, RecurrenceStats* recurrence_stats);
+// Gather and probability-scale sampled feature columns into a dense GPU buffer.
 void cuda_gather_weighted_columns(cudaStream_t stream, const float* source_features,
-                                  float* sampled_features, size_t row_count,
-                                  size_t source_feature_count, const size_t* sampled_column_indices,
-                                  const float* sampled_column_scales, size_t sampled_feature_count,
+                                  float* sampled_features, std::size_t row_count,
+                                  std::size_t source_feature_count, const std::size_t* sampled_column_indices,
+                                  const float* sampled_column_scales, std::size_t sampled_feature_count,
                                   float scale_multiplier);
+// Reduce logistic objective and correct-prediction counts across all samples.
 void cuda_accumulate_metrics(cudaStream_t stream, const float* signed_margins, const float* labels,
-                             size_t sample_count, MetricSums* metric_sums);
-
-void train(const DataParams* data_params, const RunParams* run_params, Workspace* workspace,
+                             std::size_t sample_count, void* reduction_workspace,
+                             std::size_t reduction_workspace_size, MetricSums* metric_sums);
+// Train the model with the pipelined adaptive s-step algorithm.
+void train(const DataParams& data_params, const RunParams& run_params, Workspace* workspace,
            ProfileStats* profile_stats);
