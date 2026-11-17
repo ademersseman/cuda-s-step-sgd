@@ -5,6 +5,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -16,7 +17,53 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+namespace {
+// Serialize large host-side dataset loads when several GPU workers share a node.
+class DatasetLoadLock {
+  public:
+    explicit DatasetLoadLock(const char* path) {
+        if (path == nullptr || *path == '\0')
+            return;
+        descriptor_ = open(path, O_CREAT | O_RDWR, 0600);
+        if (descriptor_ == -1)
+            throw std::system_error(errno, std::generic_category(), "open dataset-load lock");
+        if (flock(descriptor_, LOCK_EX) == -1) {
+            const int error = errno;
+            close(descriptor_);
+            descriptor_ = -1;
+            throw std::system_error(error, std::generic_category(), "lock dataset load");
+        }
+        locked_ = true;
+    }
+
+    ~DatasetLoadLock() {
+        release();
+        if (descriptor_ != -1)
+            close(descriptor_);
+    }
+
+    DatasetLoadLock(const DatasetLoadLock&) = delete;
+    DatasetLoadLock& operator=(const DatasetLoadLock&) = delete;
+
+    void release() {
+        if (locked_) {
+            flock(descriptor_, LOCK_UN);
+            locked_ = false;
+        }
+    }
+
+  private:
+    int descriptor_{-1};
+    bool locked_{false};
+};
+} // namespace
 
 // Compute the full-dataset logistic objective and classification accuracy on the GPU.
 void compute_metrics(const DataParams& data_params, Workspace* workspace, double& objective,
@@ -639,7 +686,8 @@ int run_main(int argc, char** argv) {
               << ", learning_rate: " << run_params.learning_rate
               << ", sketch_seed: " << run_params.sketch_seed
               << ", checkpoint_interval: " << run_params.checkpoint_interval << '\n';
-    // load raw data into host
+    // Hold at most one full host dataset while concurrent workers upload to separate GPUs.
+    DatasetLoadLock dataset_load_lock{std::getenv("SSTEP_DATASET_LOAD_LOCK")};
     std::vector<float> host_features{};
     std::vector<float> host_labels{};
     load_dataset(data_params, host_features, host_labels);
@@ -670,6 +718,8 @@ int run_main(int argc, char** argv) {
     check_cuda(cudaMemcpy(device_features, host_features.data(),
                           data_params.sample_count * data_params.feature_count * sizeof(float),
                           cudaMemcpyHostToDevice));
+    std::vector<float>{}.swap(host_features);
+    dataset_load_lock.release();
     if (extra_samples != 0) {
         check_cuda(cudaMemset(
             device_features + data_params.sample_count * data_params.feature_count, 0,
@@ -708,6 +758,7 @@ int run_main(int argc, char** argv) {
     // Copy labels and zero the labels belonging to the GPU-only feature padding.
     check_cuda(cudaMemcpy(workspace.device_labels, host_labels.data(),
                           data_params.sample_count * sizeof(float), cudaMemcpyHostToDevice));
+    std::vector<float>{}.swap(host_labels);
     if (extra_samples != 0)
         check_cuda(cudaMemset(workspace.device_labels + data_params.sample_count, 0,
                               extra_samples * sizeof(float)));
