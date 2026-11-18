@@ -25,7 +25,7 @@ LeverageSketch prepare_leverage_sketch(const DataParams& data_params, const RunP
     return leverage_sketch;
 }
 
-// Queue sampling, gathering, and full-Gram construction for one double-buffer slot.
+// Queue sampled features and, for explicit backends, their Gram in the next slot.
 void prefetch_leverage_features(const DataParams& data_params, const RunParams& run_params,
                                 Workspace* workspace, float* device_next_signed_batch,
                                 std::size_t slot_index, std::size_t sampled_feature_count) {
@@ -50,14 +50,16 @@ void prefetch_leverage_features(const DataParams& data_params, const RunParams& 
                                  target_slot.device_sampled_column_indices,
                                  target_slot.device_sampled_column_scales,
                                  sampled_feature_count, scale_multiplier);
-    constexpr float one{1.0f};
-    constexpr float zero{0.0f};
-    const int sample_count = run_params.samples_per_iteration;
-    const int active_feature_count = static_cast<int>(sampled_feature_count);
-    // Materialize only the lower Gram triangle consumed by the recurrence.
-    check_cublas(cublasSsyrk(
-        workspace->prefetch_cublas_handle, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T, sample_count,
-        active_feature_count, &one, target_slot.device_sampled_features, active_feature_count,
-        &zero, target_slot.device_approximate_gram, sample_count));
+    if (run_params.gram_kernel != GramKernel::factor) {
+        constexpr float one{1.0f};
+        constexpr float zero{0.0f};
+        const int sample_count = run_params.samples_per_iteration;
+        const int active_feature_count = static_cast<int>(sampled_feature_count);
+        // Materialize only the lower Gram triangle consumed by the recurrence.
+        check_cublas(cublasSsyrk(
+            workspace->prefetch_cublas_handle, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T, sample_count,
+            active_feature_count, &one, target_slot.device_sampled_features, active_feature_count,
+            &zero, target_slot.device_approximate_gram, sample_count));
+    }
     check_cuda(cudaEventRecord(target_slot.prefetch_done, workspace->prefetch_stream));
 }

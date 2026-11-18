@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_reduce.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
@@ -8,6 +9,8 @@
 #include "s_step_sgd.hpp"
 
 constexpr std::size_t kBlockSize{256};
+constexpr int kGramTileRows{8};
+constexpr int kWarpSize{32};
 
 struct AddRecurrenceStats {
     __device__ RecurrenceStats operator()(const RecurrenceStats& left,
@@ -78,6 +81,130 @@ __global__ void corrected_sigmoid_and_accumulate_kernel(const float* corrected_m
                   block_sum.base_residual_squared_sum);
     }
 }
+
+__global__ void fused_gram_recurrence_kernel(const float* gram, const float* base_residuals,
+                                             float* margins, int sample_count, int batch_size,
+                                             float alpha, RecurrenceStats* stats) {
+    __shared__ float partial[kWarpSize][kGramTileRows + 1];
+    __shared__ float difference_squared[kGramTileRows];
+    __shared__ float base_squared[kGramTileRows];
+    const int tile_start = blockIdx.x * kGramTileRows;
+    const int tile_row = threadIdx.x % kGramTileRows;
+    const int partition = threadIdx.x / kGramTileRows;
+    const int row = tile_start + tile_row;
+    const int preceding_rows = row < sample_count ? row - row % batch_size : 0;
+    float sum = 0.0f;
+    // Eight adjacent lanes read adjacent rows of the column-major SYRK output.
+    for (int col = partition; col < preceding_rows; col += kWarpSize) {
+        sum = fmaf(gram[static_cast<std::size_t>(col) * sample_count + row],
+                   base_residuals[col], sum);
+    }
+    partial[partition][tile_row] = sum;
+    __syncthreads();
+
+    // Transpose partial sums in shared memory so each warp finishes one row.
+    const int warp = threadIdx.x / kWarpSize;
+    const int lane = threadIdx.x % kWarpSize;
+    sum = partial[lane][warp];
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    if (lane == 0) {
+        const int output_row = tile_start + warp;
+        float difference = 0.0f;
+        float base = 0.0f;
+        if (output_row < sample_count) {
+            base = base_residuals[output_row];
+            const float margin = fmaf(alpha, sum, margins[output_row]);
+            const float corrected = 1.0f / (1.0f + __expf(margin));
+            margins[output_row] = corrected;
+            difference = corrected - base;
+        }
+        difference_squared[warp] = difference * difference;
+        base_squared[warp] = base * base;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float difference_sum = 0.0f;
+        float base_sum = 0.0f;
+        for (int i = 0; i < kGramTileRows; ++i) {
+            difference_sum += difference_squared[i];
+            base_sum += base_squared[i];
+        }
+        atomicAdd(&stats->corrected_residual_difference_squared_sum, difference_sum);
+        atomicAdd(&stats->base_residual_squared_sum, base_sum);
+    }
+}
+
+void cuda_fused_gram_recurrence(cudaStream_t stream, const float* gram, const float* base_residuals,
+                                float* margins, int sample_count, int batch_size, float alpha,
+                                RecurrenceStats* stats) {
+    check_cuda(cudaMemsetAsync(stats, 0, sizeof(RecurrenceStats), stream));
+    const int blocks = 1 + (sample_count - 1) / kGramTileRows;
+    fused_gram_recurrence_kernel<<<blocks, kWarpSize * kGramTileRows, 0, stream>>>(
+        gram, base_residuals, margins, sample_count, batch_size, alpha, stats);
+    check_cuda(cudaGetLastError());
+}
+
+__global__ void factor_batch_sums_kernel(const float* factor, const float* base, float* sums,
+                                         int batch_size, int width, std::size_t entries) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= entries)
+        return;
+    const std::size_t first = (index / width) * batch_size;
+    const std::size_t offset = first * width + index % width;
+    float sum = 0.0f;
+    for (int i = 0; i < batch_size; ++i)
+        sum = fmaf(factor[offset + static_cast<std::size_t>(i) * width], base[first + i], sum);
+    sums[index] = sum;
+}
+
+// Each block scans one feature through all minibatches, carrying totals between tiles.
+__global__ void factor_exclusive_scan_kernel(float* sums, int steps, int width) {
+    using Scan = cub::BlockScan<float, kBlockSize>;
+    __shared__ typename Scan::TempStorage storage;
+    float carry = 0.0f;
+    for (std::size_t start = 0; start < steps; start += kBlockSize) {
+        const auto batch = start + threadIdx.x;
+        const auto index = batch * width + blockIdx.x;
+        const float value = batch < steps ? sums[index] : 0.0f;
+        float prefix, total;
+        Scan(storage).ExclusiveSum(value, prefix, total);
+        if (batch < steps)
+            sums[index] = carry + prefix;
+        carry += total;
+        __syncthreads();
+    }
+}
+
+__global__ void apply_factor_prefix_kernel(const float* factor, const float* prefix, float* margins,
+                                           int sample_count, int batch_size, int width, float alpha) {
+    const std::size_t row = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= sample_count)
+        return;
+    const float* feature_row = factor + row * width;
+    const float* preceding = prefix + (row / batch_size) * width;
+    float dot = 0.0f;
+    for (int k = 0; k < width; ++k)
+        dot = fmaf(feature_row[k], preceding[k], dot);
+    margins[row] = fmaf(alpha, dot, margins[row]);
+}
+
+void cuda_factor_recurrence(cudaStream_t stream, const float* factor, const float* base_residuals,
+                            float* margins, float* prefix, int batch_size, int steps, int width,
+                            float alpha, RecurrenceStats* stats) {
+    const std::size_t entries = static_cast<std::size_t>(steps) * width;
+    const int sample_count = steps * batch_size;
+    factor_batch_sums_kernel<<<(entries + kBlockSize - 1) / kBlockSize, kBlockSize, 0, stream>>>(
+        factor, base_residuals, prefix, batch_size, width, entries);
+    check_cuda(cudaGetLastError());
+    factor_exclusive_scan_kernel<<<width, kBlockSize, 0, stream>>>(prefix, steps, width);
+    check_cuda(cudaGetLastError());
+    apply_factor_prefix_kernel<<<(sample_count + kBlockSize - 1) / kBlockSize, kBlockSize, 0, stream>>>(
+        factor, prefix, margins, sample_count, batch_size, width, alpha);
+    check_cuda(cudaGetLastError());
+    cuda_corrected_sigmoid_and_accumulate(stream, margins, base_residuals, margins, sample_count, stats);
+}
+
 // Gather selected columns and apply leverage-probability scaling to each output entry.
 __global__ void gather_weighted_columns_kernel(
     const float* source_features, float* sampled_features, std::size_t row_count,
