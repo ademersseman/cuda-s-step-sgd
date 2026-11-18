@@ -395,6 +395,8 @@ struct ProfileStats {
     float training_time_ms{0.0f};
 };
 
+enum class GramKernel { cublas, fused, factor };
+
 struct RunParams {
     int batch_size{16};
     int s{4};
@@ -408,17 +410,17 @@ struct RunParams {
     std::size_t leverage_row_count{512};
     float uniform_probability_mix{0.1f};
     unsigned int sketch_seed{0};
+    GramKernel gram_kernel{GramKernel::cublas};
     bool trace_controller{false};
     int checkpoint_interval{0};
     std::string checkpoint_prefix{};
 };
 
-inline constexpr std::array<std::size_t, 8> adaptive_sampled_feature_counts{
-    2, 4, 8, 16, 32, 64, 128, 256};
+inline constexpr std::size_t minimum_sampled_feature_count{2};
 
 struct DataParams {
-    std::string dataset_path{};
-    std::size_t feature_count{300};
+    std::string dataset_path{"w1a.txt"};
+    std::size_t feature_count{0};
     std::size_t sample_count{0};
     std::size_t padded_sample_count{0};
     std::uint64_t dataset_seed{0};
@@ -485,6 +487,7 @@ struct ControllerStatsSlot {
 
 struct RecurrenceGraph {
     std::size_t slot_index{0};
+    int width{0};
     CudaGraph graph{};
     CudaGraphExec executable{};
 };
@@ -500,6 +503,7 @@ struct Workspace {
     DeviceBuffer<std::byte> device_metric_reduction_workspace{};
     std::size_t metric_reduction_workspace_size{0};
     DeviceBuffer<RecurrenceStats> device_recurrence_stats{};
+    DeviceBuffer<float> device_factor_prefix{};
     LeverageSketch leverage_sketch{};
 
     CudaStream prefetch_stream{};
@@ -535,9 +539,12 @@ struct Workspace {
                 static_cast<std::size_t>(run_params.samples_per_iteration);
             device_base_residuals.allocate(run_params.samples_per_iteration);
             device_recurrence_stats.allocate(1);
+            if (run_params.gram_kernel == GramKernel::factor)
+                device_factor_prefix.allocate(run_params.s * leverage_sketch.size());
             for (auto& batch_slot : sampled_batch_slots) {
                 batch_slot.device_sampled_features.allocate(sampled_element_count);
-                batch_slot.device_approximate_gram.allocate(sample_count * sample_count);
+                if (run_params.gram_kernel != GramKernel::factor)
+                    batch_slot.device_approximate_gram.allocate(sample_count * sample_count);
                 batch_slot.device_random_values.allocate(2 * leverage_sketch.size());
                 batch_slot.device_sampled_column_indices.allocate(leverage_sketch.size());
                 batch_slot.device_sampled_column_scales.allocate(leverage_sketch.size());
@@ -564,7 +571,9 @@ struct Workspace {
 
 // Compute one block's base margins and launch its sampled recurrence graph.
 void enter_recurrence(const DataParams& data_params, const RunParams& run_params,
-                      Workspace* workspace, float* device_signed_batch);
+                      Workspace* workspace, float* device_signed_batch, int active_width, int valid_rows);
+
+void cuda_mask_padded_margins(cudaStream_t stream, float* margins, int valid_rows, int block_rows);
 
 // Convert signed margins into logistic residuals on a CUDA stream.
 void cuda_sigmoid(cudaStream_t stream, const float* signed_margins, float* residuals,
@@ -573,6 +582,14 @@ void cuda_sigmoid(cudaStream_t stream, const float* signed_margins, float* resid
 void cuda_corrected_sigmoid_and_accumulate(cudaStream_t stream, const float* corrected_margins,
                                            const float* base_residuals, float* corrected_residuals,
                                            std::size_t sample_count, RecurrenceStats* recurrence_stats);
+// Apply the strict block-lower Gram to frozen residuals and overwrite margins with residuals.
+void cuda_fused_gram_recurrence(cudaStream_t stream, const float* gram, const float* base_residuals,
+                                float* margins, int sample_count, int batch_size, float alpha,
+                                RecurrenceStats* stats);
+// Compute and apply exclusive minibatch prefixes for a packed row-major low-rank factor.
+void cuda_factor_recurrence(cudaStream_t stream, const float* factor, const float* base_residuals,
+                            float* margins, float* prefix, int batch_size, int steps, int width,
+                            float alpha, RecurrenceStats* stats);
 // Gather and probability-scale sampled feature columns into a dense GPU buffer.
 void cuda_gather_weighted_columns(cudaStream_t stream, const float* source_features,
                                   float* sampled_features, std::size_t row_count,

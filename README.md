@@ -26,14 +26,21 @@ weights sampled column `j` by `1/sqrt(l*p[j])`:
 doubles the width when the smoothed residual-correction ratio exceeds `0.20`,
 and halves it after three consecutive updates below `0.05`.
 
+The loader accepts binary labels encoded as either `{-1,+1}` or `{0,1}` in
+LIBSVM and SSTEPDS1 files. Padding rows are excluded from the adaptive
+correction ratio.
+
 Run `./builds/release/s_step_sgd --help` for all named options. The original positional
 arguments remain available for existing benchmark scripts.
 
-For weighted sample matrix `B`, the prefetch stream uses cuBLAS SYRK to construct
-the lower triangle of the `(batch_size*s)^2` sampled Gram `G=B*B^T` ahead of
-use. Two slots store the sampled features and square Gram buffers so one block
+For the weighted feature matrix `B`, the `cublas` (default) and `fused`
+backends use cuBLAS SYRK on the prefetch stream to construct the lower
+triangle of the sampled Gram `G=B*B^T`. Two slots store the sampled features and square Gram buffers so one block
 can be prepared while the other is consumed. The recurrence references only
-blocks `G_ij` with `j<i`; diagonal and upper blocks are never read.
+blocks `G_ij` with `j<i`. The fused kernel applies these blocks together.
+With `--gram-kernel factor`, the recurrence uses exclusive minibatch prefixes
+of the weighted sampled features and omits the square Gram buffers. All three
+backends use residuals frozen at block entry.
 
 The `leverage` argument is retained for compatibility with existing benchmark
 scripts. The uniform and scoring paths have been removed. Sampling is with

@@ -117,8 +117,8 @@ void save_training_checkpoint(const DataParams& data_params, const RunParams& ru
               << " weights_path=" << checkpoint_path << '\n';
 }
 
-// Submit the cuBLAS and CUDA operations that apply one sampled s-step recurrence.
-void launch_cublas_recurrence(const RunParams& run_params, Workspace* workspace) {
+// Apply one sampled s-step recurrence using frozen base residuals.
+void launch_recurrence(const RunParams& run_params, Workspace* workspace, int width) {
     const int batch_size = run_params.batch_size;
     const int sample_count = run_params.samples_per_iteration;
     constexpr float one{1.0f};
@@ -128,8 +128,22 @@ void launch_cublas_recurrence(const RunParams& run_params, Workspace* workspace)
                  workspace->device_base_residuals, run_params.samples_per_iteration);
     const float learning_rate_per_sample =
         run_params.learning_rate / static_cast<float>(batch_size);
-    const float* gram =
-        workspace->sampled_batch_slots[workspace->current_slot_index].device_approximate_gram;
+    const auto& slot = workspace->sampled_batch_slots[workspace->current_slot_index];
+    if (run_params.gram_kernel == GramKernel::factor) {
+        cuda_factor_recurrence(workspace->compute_stream, slot.device_sampled_features,
+                               workspace->device_base_residuals, workspace->device_block_margins_or_residuals,
+                               workspace->device_factor_prefix, batch_size, run_params.s, width,
+                               learning_rate_per_sample, workspace->device_recurrence_stats);
+        return;
+    }
+    const float* gram = slot.device_approximate_gram;
+    if (run_params.gram_kernel == GramKernel::fused) {
+        cuda_fused_gram_recurrence(
+            workspace->compute_stream, gram, workspace->device_base_residuals,
+            workspace->device_block_margins_or_residuals, sample_count, batch_size,
+            learning_rate_per_sample, workspace->device_recurrence_stats);
+        return;
+    }
     // Reference only Gram blocks G_ij with j < i; diagonal and upper blocks are ignored.
     for (int minibatch_index = 1; minibatch_index < run_params.s; ++minibatch_index) {
         const int preceding_sample_count = minibatch_index * batch_size;
@@ -147,43 +161,56 @@ void launch_cublas_recurrence(const RunParams& run_params, Workspace* workspace)
 }
 
 // Find the captured recurrence executable for a double-buffer slot.
-cudaGraphExec_t recurrence_graph_for(const Workspace* workspace, std::size_t slot_index) {
+cudaGraphExec_t recurrence_graph_for(const Workspace* workspace, std::size_t slot_index, int width) {
     const auto graph =
         std::find_if(workspace->recurrence_graphs.begin(), workspace->recurrence_graphs.end(),
-                     [slot_index](const RecurrenceGraph& candidate) {
-                         return candidate.slot_index == slot_index;
+                     [slot_index, width](const RecurrenceGraph& candidate) {
+                         return candidate.slot_index == slot_index && candidate.width == width;
                      });
     if (graph == workspace->recurrence_graphs.end())
         throw std::runtime_error("missing recurrence CUDA graph");
     return graph->executable;
 }
 
-// Warm and capture one recurrence CUDA Graph for each double-buffer slot.
+// Capture each slot's recurrence, specializing factor graphs to their packed width.
 void prepare_recurrence_graphs(const RunParams& run_params, Workspace* workspace) {
     const std::size_t original_slot_index = workspace->current_slot_index;
     // Initialize cuBLAS's fixed-shape GEMV before stream capture.
-    workspace->current_slot_index = 0;
-    launch_cublas_recurrence(run_params, workspace);
-    check_cuda(cudaStreamSynchronize(workspace->compute_stream));
+    if (run_params.gram_kernel == GramKernel::cublas) {
+        workspace->current_slot_index = 0;
+        launch_recurrence(run_params, workspace, 0);
+        check_cuda(cudaStreamSynchronize(workspace->compute_stream));
+    }
 
     for (std::size_t slot_index = 0; slot_index < workspace->sampled_batch_slots.size();
          ++slot_index) {
         workspace->current_slot_index = slot_index;
-        RecurrenceGraph recurrence_graph{slot_index};
-        check_cuda(cudaStreamBeginCapture(workspace->compute_stream,
-                                          cudaStreamCaptureModeThreadLocal));
-        launch_cublas_recurrence(run_params, workspace);
-        check_cuda(cudaStreamEndCapture(workspace->compute_stream, recurrence_graph.graph.put()));
-        check_cuda(
-            cudaGraphInstantiate(recurrence_graph.executable.put(), recurrence_graph.graph, 0));
-        workspace->recurrence_graphs.push_back(std::move(recurrence_graph));
+        const auto capture = [&](int width) {
+            RecurrenceGraph recurrence_graph{slot_index, width};
+            check_cuda(cudaStreamBeginCapture(workspace->compute_stream,
+                                              cudaStreamCaptureModeThreadLocal));
+            launch_recurrence(run_params, workspace, width);
+            check_cuda(cudaStreamEndCapture(workspace->compute_stream, recurrence_graph.graph.put()));
+            check_cuda(
+                cudaGraphInstantiate(recurrence_graph.executable.put(), recurrence_graph.graph, 0));
+            workspace->recurrence_graphs.push_back(std::move(recurrence_graph));
+        };
+        if (run_params.gram_kernel != GramKernel::factor) {
+            capture(0);
+        } else if (run_params.fixed_sampled_feature_count) {
+            capture(static_cast<int>(run_params.fixed_sampled_feature_count));
+        } else {
+            for (int width = minimum_sampled_feature_count;
+                 width <= static_cast<int>(workspace->leverage_sketch.size()); width *= 2)
+                capture(width);
+        }
     }
     workspace->current_slot_index = original_slot_index;
 }
 
 // Compute base margins and replay the captured recurrence for the current block.
 void enter_recurrence(const DataParams& data_params, const RunParams& run_params,
-                      Workspace* workspace, float* device_signed_batch) {
+                      Workspace* workspace, float* device_signed_batch, int active_width, int valid_rows) {
     constexpr float alpha{1};
     constexpr float beta{0};
 
@@ -196,10 +223,13 @@ void enter_recurrence(const DataParams& data_params, const RunParams& run_params
                                  workspace->device_block_margins_or_residuals, 1));
     }
 
+    cuda_mask_padded_margins(workspace->compute_stream, workspace->device_block_margins_or_residuals,
+                             valid_rows, run_params.samples_per_iteration);
     {
         nvtx3::scoped_range recurrence_range{"recurrence graph"};
-        // Replay the captured recurrence using the Gram stored in the current slot.
-        check_cuda(cudaGraphLaunch(recurrence_graph_for(workspace, workspace->current_slot_index),
+        // Explicit Grams share a graph across widths. Packed factors use width as their stride.
+        const int width = run_params.gram_kernel == GramKernel::factor ? active_width : 0;
+        check_cuda(cudaGraphLaunch(recurrence_graph_for(workspace, workspace->current_slot_index, width),
                                    workspace->compute_stream));
     }
 }
@@ -315,7 +345,7 @@ void train(const DataParams& data_params, const RunParams& run_params, Workspace
         return;
     }
 
-    // Capture one cuBLAS recurrence graph for each buffer slot and adaptive sampled width.
+    // Capture the recurrence graphs for both prefetch slots.
     {
         nvtx3::scoped_range graph_capture_range{"capture recurrence graphs"};
         prepare_recurrence_graphs(run_params, workspace);
@@ -336,7 +366,7 @@ void train(const DataParams& data_params, const RunParams& run_params, Workspace
     bool has_smoothed_correction_ratio = false;
     std::size_t controller_sampled_feature_count = workspace->leverage_sketch.size(0);
     const std::size_t maximum_controller_sampled_feature_count =
-        std::min(workspace->leverage_sketch.size(), adaptive_sampled_feature_counts.back());
+        workspace->leverage_sketch.size();
     std::size_t consecutive_low_ratio_updates = 0;
     std::vector<float> correction_ratio_history;
     if (run_params.trace_controller)
@@ -418,7 +448,7 @@ void train(const DataParams& data_params, const RunParams& run_params, Workspace
                         if (consecutive_low_ratio_updates >= low_ratio_updates_before_decrease) {
                             const std::size_t decreased_sampled_feature_count =
                                 std::max(controller_sampled_feature_count / 2,
-                                         adaptive_sampled_feature_counts.front());
+                                         minimum_sampled_feature_count);
                             width_changed =
                                 decreased_sampled_feature_count != controller_sampled_feature_count;
                             controller_sampled_feature_count = decreased_sampled_feature_count;
@@ -461,7 +491,10 @@ void train(const DataParams& data_params, const RunParams& run_params, Workspace
         const std::size_t active_sampled_feature_count = workspace->leverage_sketch.size(block_index);
         sampled_feature_count_sum += active_sampled_feature_count;
         ++sampled_feature_count_histogram[active_sampled_feature_count];
-        enter_recurrence(data_params, run_params, workspace, device_signed_batch);
+        const auto valid_rows = std::min<std::size_t>(run_params.samples_per_iteration,
+                                                      data_params.sample_count - current_batch_start_offset);
+        enter_recurrence(data_params, run_params, workspace, device_signed_batch,
+                         static_cast<int>(active_sampled_feature_count), static_cast<int>(valid_rows));
 
         // Record when recurrence finishes reading this buffer so prefetch can safely reuse it.
         check_cuda(cudaEventRecord(current_batch_slot.compute_done, workspace->compute_stream));
@@ -579,6 +612,7 @@ void print_usage(const char* program) {
               << "  --n-iters N          block iterations (default 100)\n"
               << "  --dataset FILE       LIBSVM or shared-binary dataset (default w1a.txt)\n"
               << "  --sampled-features N maximum leverage samples (default 512)\n"
+              << "  --gram-kernel MODE   apply Gram corrections with cublas (default), fused, or factor\n"
               << "  --fixed-l N          hold leverage sample width constant (power of two, 2-512)\n"
               << "  --leverage-rank N    randomized leverage basis rank (default 32)\n"
               << "  --leverage-rows N    dataset rows used to prepare leverage scores (default 512)\n"
@@ -608,7 +642,22 @@ int run_main(int argc, char** argv) {
     DataParams data_params{};
     std::string weights_output_path{};
 
-    for (int argument_index = 1; argument_index < argc; ++argument_index) {
+    int first_option = 1;
+    if (argc > 1 && argv[1][0] != '-') {
+        if ((argc != 8 && argc != 9) || std::string(argv[5]) != "leverage")
+            throw std::invalid_argument(
+                "Expected batch_size s n_iters dataset leverage sampled_features eta [weights_out]");
+        run_params.batch_size = std::max(1, std::stoi(argv[1]));
+        run_params.s = std::max(1, std::stoi(argv[2]));
+        run_params.iteration_count = std::max(1, std::stoi(argv[3]));
+        data_params.dataset_path = argv[4];
+        run_params.requested_sampled_feature_count = std::stoull(argv[6]);
+        run_params.learning_rate = std::stof(argv[7]);
+        if (argc == 9)
+            weights_output_path = argv[8];
+        first_option = argc;
+    }
+    for (int argument_index = first_option; argument_index < argc; ++argument_index) {
         const std::string option{argv[argument_index]};
         if (option == "-h" || option == "--help") {
             print_usage(argv[0]);
@@ -628,6 +677,16 @@ int run_main(int argc, char** argv) {
         } else if (option == "--sampled-features") {
             run_params.requested_sampled_feature_count =
                 std::stoull(consume_option_value(argc, argv, argument_index, option));
+        } else if (option == "--gram-kernel") {
+            const std::string mode = consume_option_value(argc, argv, argument_index, option);
+            if (mode == "cublas")
+                run_params.gram_kernel = GramKernel::cublas;
+            else if (mode == "fused")
+                run_params.gram_kernel = GramKernel::fused;
+            else if (mode == "factor")
+                run_params.gram_kernel = GramKernel::factor;
+            else
+                throw std::invalid_argument("--gram-kernel must be cublas, fused, or factor");
         } else if (option == "--fixed-l") {
             run_params.fixed_sampled_feature_count =
                 std::stoull(consume_option_value(argc, argv, argument_index, option));
@@ -659,12 +718,12 @@ int run_main(int argc, char** argv) {
     }
 
     const std::size_t maximum_l = run_params.requested_sampled_feature_count;
-    if (maximum_l < 2 || maximum_l > 512 || (maximum_l & (maximum_l - 1)) != 0)
+    if (maximum_l < minimum_sampled_feature_count || maximum_l > 512 || (maximum_l & (maximum_l - 1)) != 0)
         throw std::invalid_argument(
             "--sampled-features must be a power of two from 2 through 512");
     const std::size_t fixed_l = run_params.fixed_sampled_feature_count;
     if (fixed_l != 0 &&
-        (fixed_l < 2 || fixed_l > 512 || (fixed_l & (fixed_l - 1)) != 0))
+        (fixed_l < minimum_sampled_feature_count || fixed_l > 512 || (fixed_l & (fixed_l - 1)) != 0))
         throw std::invalid_argument("--fixed-l must be a power of two from 2 through 512");
     if (fixed_l > run_params.requested_sampled_feature_count)
         throw std::invalid_argument("--fixed-l cannot exceed --sampled-features");
@@ -680,6 +739,8 @@ int run_main(int argc, char** argv) {
               << ", iteration_count: " << run_params.iteration_count
               << ", training_set: " << data_params.dataset_path << ", gram_mode: leverage"
               << ", requested_sampled_feature_count: " << run_params.requested_sampled_feature_count
+              << ", gram_kernel: " << (run_params.gram_kernel == GramKernel::factor ? "factor" :
+                                     run_params.gram_kernel == GramKernel::fused ? "fused" : "cublas")
               << ", fixed_l: " << run_params.fixed_sampled_feature_count
               << ", leverage_rank: " << run_params.leverage_rank
               << ", leverage_rows: " << run_params.leverage_row_count

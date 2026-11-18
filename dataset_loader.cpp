@@ -1,6 +1,8 @@
 #include "dataset_loader.hpp"
 
+#include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <fstream>
 #include <sstream>
@@ -39,26 +41,79 @@ void load_binary(DataParams& data_params, std::ifstream& file, std::vector<float
 // Parse sparse LIBSVM text rows into a dense row-major host matrix.
 void load_text(DataParams& data_params, std::ifstream& file, std::vector<float>& host_features,
                std::vector<float>& host_labels) {
-    std::string line;
-    while (std::getline(file, line)) {
-        std::istringstream line_stream{line};
-        float label{};
-        line_stream >> label;
-        host_labels.push_back(label);
-        const std::size_t row_offset{host_features.size()};
-        host_features.resize(row_offset + data_params.feature_count, 0.0f);
-        float* row = host_features.data() + row_offset;
-        std::string token;
-        while (line_stream >> token) {
-            const auto separator_position = token.find(':');
-            if (separator_position == std::string::npos)
+    std::size_t width = 0;
+    std::size_t row_count = 0;
+    // Determine the stride before allocating the dense matrix. The widest row can be last.
+    for (bool fill : {false, true}) {
+        std::string line;
+        std::size_t row = 0;
+        while (std::getline(file, line)) {
+            std::istringstream fields{line};
+            fields >> std::ws;
+            if (fields.eof() || fields.peek() == '#')
                 continue;
-            const std::size_t feature_index =
-                static_cast<std::size_t>(std::stoi(token.substr(0, separator_position)) - 1);
-            if (feature_index < data_params.feature_count)
-                row[feature_index] = std::stof(token.substr(separator_position + 1));
+            float label;
+            if (!(fields >> label))
+                throw std::runtime_error("Invalid LIBSVM label");
+            if (fill) {
+                if (row >= row_count)
+                    throw std::runtime_error("LIBSVM row count changed while loading");
+                host_labels[row] = label;
+            }
+
+            std::string token;
+            while (fields >> token && token.front() != '#') {
+                const auto colon = token.find(':');
+                if (colon == std::string::npos)
+                    throw std::runtime_error("Invalid LIBSVM feature: " + token);
+                int column;
+                const char* end = token.data() + colon;
+                const auto parsed = std::from_chars(token.data(), end, column);
+                if (parsed.ec != std::errc{} || parsed.ptr != end || column < 1)
+                    throw std::runtime_error("Invalid LIBSVM feature index: " + token);
+                const auto index = static_cast<std::size_t>(column);
+                if (fill) {
+                    if (index > width)
+                        throw std::runtime_error("LIBSVM feature count changed while loading");
+                    std::size_t consumed;
+                    const float value = std::stof(token.substr(colon + 1), &consumed);
+                    if (consumed != token.size() - colon - 1)
+                        throw std::runtime_error("Invalid LIBSVM feature value: " + token);
+                    host_features[row * width + index - 1] = value;
+                } else {
+                    width = std::max(width, index);
+                }
+            }
+            ++row;
+        }
+        if (!file.eof() || file.bad())
+            throw std::runtime_error("Error reading LIBSVM dataset: " + data_params.dataset_path);
+        if (!fill) {
+            row_count = row;
+            if (width == 0 || row_count > host_features.max_size() / width)
+                throw std::runtime_error("Invalid LIBSVM dataset dimensions");
+            host_features.assign(row_count * width, 0.0f);
+            host_labels.resize(row_count);
+            file.clear();
+            file.seekg(0);
+        } else if (row != row_count) {
+            throw std::runtime_error("LIBSVM row count changed while loading");
         }
     }
+    data_params.feature_count = width;
+}
+// Accept a single binary encoding per file. Internal zero labels are reserved for padding.
+void normalize_binary_labels(std::vector<float>& labels) {
+    bool has_zero = false;
+    bool has_negative = false;
+    for (float label : labels) {
+        has_zero |= label == 0.0f;
+        has_negative |= label == -1.0f;
+        if ((label != -1.0f && label != 0.0f && label != 1.0f) || (has_zero && has_negative))
+            throw std::runtime_error("Expected binary labels encoded as {-1,+1} or {0,1}");
+    }
+    if (has_zero)
+        std::replace(labels.begin(), labels.end(), 0.0f, -1.0f);
 }
 } // namespace
 
@@ -77,4 +132,5 @@ void load_dataset(DataParams& data_params, std::vector<float>& host_features,
         file.seekg(0);
         load_text(data_params, file, host_features, host_labels);
     }
+    normalize_binary_labels(host_labels);
 }
