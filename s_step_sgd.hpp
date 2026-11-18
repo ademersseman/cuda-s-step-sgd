@@ -571,7 +571,9 @@ struct Workspace {
 
 // Compute one block's base margins and launch its sampled recurrence graph.
 void enter_recurrence(const DataParams& data_params, const RunParams& run_params,
-                      Workspace* workspace, float* device_signed_batch, int active_width);
+                      Workspace* workspace, float* device_signed_batch, int active_width, int valid_rows);
+
+void cuda_mask_padded_margins(cudaStream_t stream, float* margins, int valid_rows, int block_rows);
 
 // Convert signed margins into logistic residuals on a CUDA stream.
 void cuda_sigmoid(cudaStream_t stream, const float* signed_margins, float* residuals,

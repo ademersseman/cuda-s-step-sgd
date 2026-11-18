@@ -102,6 +102,19 @@ void load_text(DataParams& data_params, std::ifstream& file, std::vector<float>&
     }
     data_params.feature_count = width;
 }
+// Accept a single binary encoding per file. Internal zero labels are reserved for padding.
+void normalize_binary_labels(std::vector<float>& labels) {
+    bool has_zero = false;
+    bool has_negative = false;
+    for (float label : labels) {
+        has_zero |= label == 0.0f;
+        has_negative |= label == -1.0f;
+        if ((label != -1.0f && label != 0.0f && label != 1.0f) || (has_zero && has_negative))
+            throw std::runtime_error("Expected binary labels encoded as {-1,+1} or {0,1}");
+    }
+    if (has_zero)
+        std::replace(labels.begin(), labels.end(), 0.0f, -1.0f);
+}
 } // namespace
 
 // Detect the dataset format from its magic bytes and dispatch to the matching loader.
@@ -119,4 +132,5 @@ void load_dataset(DataParams& data_params, std::vector<float>& host_features,
         file.seekg(0);
         load_text(data_params, file, host_features, host_labels);
     }
+    normalize_binary_labels(host_labels);
 }

@@ -39,6 +39,8 @@ def main():
     parser.add_argument("--baseline", choices=("cublas", "fused"), default="cublas")
     parser.add_argument("--candidate", choices=("fused", "factor"), default="fused")
     args = parser.parse_args()
+    if args.s < 2:
+        parser.error("--s must be at least 2 to exercise a Gram recurrence")
     if args.baseline == args.candidate:
         parser.error("choose distinct kernels")
     modes = (args.baseline, args.candidate)

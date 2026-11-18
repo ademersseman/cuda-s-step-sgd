@@ -210,7 +210,7 @@ void prepare_recurrence_graphs(const RunParams& run_params, Workspace* workspace
 
 // Compute base margins and replay the captured recurrence for the current block.
 void enter_recurrence(const DataParams& data_params, const RunParams& run_params,
-                      Workspace* workspace, float* device_signed_batch, int active_width) {
+                      Workspace* workspace, float* device_signed_batch, int active_width, int valid_rows) {
     constexpr float alpha{1};
     constexpr float beta{0};
 
@@ -223,6 +223,8 @@ void enter_recurrence(const DataParams& data_params, const RunParams& run_params
                                  workspace->device_block_margins_or_residuals, 1));
     }
 
+    cuda_mask_padded_margins(workspace->compute_stream, workspace->device_block_margins_or_residuals,
+                             valid_rows, run_params.samples_per_iteration);
     {
         nvtx3::scoped_range recurrence_range{"recurrence graph"};
         // Explicit Grams share a graph across widths. Packed factors use width as their stride.
@@ -489,8 +491,10 @@ void train(const DataParams& data_params, const RunParams& run_params, Workspace
         const std::size_t active_sampled_feature_count = workspace->leverage_sketch.size(block_index);
         sampled_feature_count_sum += active_sampled_feature_count;
         ++sampled_feature_count_histogram[active_sampled_feature_count];
+        const auto valid_rows = std::min<std::size_t>(run_params.samples_per_iteration,
+                                                      data_params.sample_count - current_batch_start_offset);
         enter_recurrence(data_params, run_params, workspace, device_signed_batch,
-                         static_cast<int>(active_sampled_feature_count));
+                         static_cast<int>(active_sampled_feature_count), static_cast<int>(valid_rows));
 
         // Record when recurrence finishes reading this buffer so prefetch can safely reuse it.
         check_cuda(cudaEventRecord(current_batch_slot.compute_done, workspace->compute_stream));

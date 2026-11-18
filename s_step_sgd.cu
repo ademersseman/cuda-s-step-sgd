@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_reduce.cuh>
@@ -49,6 +50,23 @@ __global__ void sigmoid_kernel(const float* signed_margins, float* residuals, st
     const std::size_t sample_index = threadIdx.x + blockIdx.x * blockDim.x;
     if (sample_index < sample_count) {
         residuals[sample_index] = 1.0f / (1.0f + __expf(signed_margins[sample_index]));
+    }
+}
+
+// A zero feature row has margin zero and residual 1/2. Mask synthetic rows so both
+// their base and corrected residuals are zero in every recurrence backend.
+__global__ void mask_padding_kernel(float* margins, int padding) {
+    const auto i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < padding)
+        margins[i] = CUDART_INF_F;
+}
+
+void cuda_mask_padded_margins(cudaStream_t stream, float* margins, int valid_rows, int block_rows) {
+    const int padding = block_rows - valid_rows;
+    if (padding > 0) {
+        mask_padding_kernel<<<(padding + kBlockSize - 1) / kBlockSize, kBlockSize, 0, stream>>>(
+            margins + valid_rows, padding);
+        check_cuda(cudaGetLastError());
     }
 }
 
