@@ -1,4 +1,4 @@
-"""Check binary label encodings and adaptive statistics on a partially padded block."""
+"""Check LIBSVM width, binary label encodings, and adaptive statistics on padded blocks."""
 
 import math
 from pathlib import Path
@@ -6,6 +6,20 @@ import struct
 import subprocess
 import sys
 import tempfile
+
+
+def check_wide_libsvm(trainer, root):
+    src = root / "wide.libsvm"
+    weights = root / "wide.f32"
+    src.write_text("+1 1:2 300:1\n-1 301:2 2000:4\n")
+    subprocess.run([trainer, "--dataset", str(src), "--batch-size", "2", "--s", "1",
+                    "--n-iters", "1", "--eta", "1", "--weights-out", str(weights)], check=True)
+    # At zero weights a single mean-gradient step gives w = (x_pos - x_neg) / 4.
+    expected = [0.0] * 2000
+    expected[0], expected[299], expected[300], expected[1999] = 0.5, 0.25, -0.5, -1.0
+    payload = weights.read_bytes()
+    assert len(payload) == 4 * len(expected), f"expected 2000 float32 weights, got {len(payload) // 4}"
+    assert list(struct.unpack("=2000f", payload)) == expected
 
 
 def main():
@@ -46,6 +60,7 @@ def main():
                     if reference is None:
                         reference = weight
                     assert math.isclose(weight, reference, rel_tol=1e-5)
+        check_wide_libsvm(trainer, root)
     return 0
 
 
